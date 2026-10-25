@@ -2695,6 +2695,9 @@ export const ja: typeof zhCN = {
     sherpaModelZipformerDesc:
       '話しながら文字が出るストリーミング型の中英モデル。遅延が最も小さく、リアルタイム文字起こしに適します。',
     sherpaModelQwen3: 'Qwen3-ASR 0.6B INT8',
+    sherpaModelQwen317b: 'Qwen3-ASR 1.7B INT8（コミュニティ変換）',
+    sherpaModelQwen317bDesc:
+      'コミュニティ変換の sherpa-onnx 1.7B モデル（ローカル固定インストール、公式ダウンロード源なし）。精度は高めだがデコードは遅め、長音声で繰り返し劣化の恐れがあります。',
     sherpaModelQwen3Desc:
       '変換済み sherpa-onnx Qwen3-ASR モデル。多言語認識とより強い長文コンテキスト処理に対応。',
     modelSelectTitle: 'この端末のモデル',
@@ -2739,6 +2742,10 @@ export const ja: typeof zhCN = {
     loadNow: '今すぐロード',
     releaseNow: '今すぐ解放',
     keepLoadedLabel: 'ロード保持時間',
+    numThreadsLabel: '推論スレッド数',
+    numThreadsDesc:
+      '空欄 = 自動（論理スレッドの 80%、最小 1）。手動入力は 1〜自動上限に制限され、モデルの次回ロード時に有効になります。',
+    numThreadsAuto: '自動',
     keepLoadedDesc:
       '現在のローカル ASR を次回の文字起こし後に保持する時間を指定します。「解放しない」は手動解放または終了まで保持します。',
     keepImmediate: '使用直後に解放',

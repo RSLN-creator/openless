@@ -219,6 +219,7 @@ impl PreferencesStore {
                 || read_preferences(&path),
             )?
         };
+        crate::shared_types::set_sherpa_num_threads_override(preferences.sherpa_onnx_num_threads);
         Ok(Self {
             path,
             state: Mutex::new(preferences),
@@ -361,6 +362,7 @@ impl PreferencesStore {
             let json = serde_json::to_vec_pretty(&value)
                 .map_err(|_| persistence_error("encode preferences"))?;
             atomic_write(&self.path, &json)?;
+            crate::shared_types::set_sherpa_num_threads_override(next.sherpa_onnx_num_threads);
             *state = next;
             Ok((result, origin))
         })

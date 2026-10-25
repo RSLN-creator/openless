@@ -1494,6 +1494,34 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     }
   };
 
+  const sherpaThreadCap = Math.max(
+    1,
+    Math.floor(((typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 4) || 4) * 0.8),
+  );
+  const [threadsInput, setThreadsInput] = useState<string>(
+    prefs?.sherpaOnnxNumThreads == null ? '' : String(prefs.sherpaOnnxNumThreads),
+  );
+  useEffect(() => {
+    setThreadsInput(prefs?.sherpaOnnxNumThreads == null ? '' : String(prefs.sherpaOnnxNumThreads));
+  }, [prefs?.sherpaOnnxNumThreads]);
+  const handleNumThreadsCommit = async () => {
+    const trimmed = threadsInput.trim();
+    try {
+      if (trimmed === '') {
+        if (prefs?.sherpaOnnxNumThreads == null) return;
+        await updatePrefs((current) => ({ ...current, sherpaOnnxNumThreads: null }));
+        return;
+      }
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed)) return;
+      const clamped = Math.min(Math.max(Math.trunc(parsed), 1), sherpaThreadCap);
+      if (prefs?.sherpaOnnxNumThreads === clamped) return;
+      await updatePrefs((current) => ({ ...current, sherpaOnnxNumThreads: clamped }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const handleReleaseEngine = async () => {
     try {
       await releaseLocalAsrEngine();
@@ -3165,6 +3193,77 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
               >
                 {sherpaBusy === 'delete' ? t('common.loading') : t('localAsr.delete')}
               </Btn>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {IS_WINDOWS && (
+        <Card
+          style={{
+            marginBottom: 16,
+            background: 'var(--ol-surface-2)',
+          }}
+        >
+          <div className="ol-model-setting-group">
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                flexWrap: 'wrap',
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <div
+                  style={{
+                    fontSize: 12.5,
+                    fontWeight: 'var(--ol-font-weight-semibold)',
+                    color: 'var(--ol-ink-3)',
+                    marginBottom: 4,
+                  }}
+                >
+                  {t('localAsr.numThreadsLabel')}
+                </div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: 'var(--ol-ink-3)',
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {t('localAsr.numThreadsDesc')}
+                </div>
+              </div>
+
+              <input
+                type="number"
+                min={1}
+                max={sherpaThreadCap}
+                aria-label={t('localAsr.numThreadsLabel')}
+                placeholder={`${t('localAsr.numThreadsAuto')} ${sherpaThreadCap}`}
+                value={threadsInput}
+                onChange={(e) => setThreadsInput(e.target.value)}
+                onBlur={() => void handleNumThreadsCommit()}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.currentTarget.blur();
+                  }
+                }}
+                style={{
+                  fontSize: 13,
+                  height: 31,
+                  width: 130,
+                  minWidth: 130,
+                  padding: '0 10px',
+                  borderRadius: 8,
+                  border: '1px solid rgba(128,128,128,0.35)',
+                  background: 'transparent',
+                  color: 'inherit',
+                }}
+              />
             </div>
           </div>
         </Card>

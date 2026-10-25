@@ -439,6 +439,69 @@ impl ModelCatalog {
                 ],
             },
         );
+        // ── Qwen3-ASR 1.7B INT8（社区转换版，本地钉住安装，无官方下载源）────────────
+        // 「拉取模型 → 适配架构」完整说明见 docs/sherpa-model-slot-guide.md。
+        // 要点：App 只按固定文件名在 models/sherpa-onnx/<alias>/ 下找模型并写入
+        // .openless-model-ready 标记，不校验内容。Pinned 变体不提供下载，只钉住
+        // 本地路径 + 精确字节数（entry_is_complete 会逐字节核对），因此换文件后
+        // 若大小变化必须同步更新这里，否则该槽位永远显示不完整。
+        let qwen17_sherpa =
+            LocalAsrTarget::parse(LocalAsrRuntime::SherpaOnnx, "qwen3-asr-1.7b-int8")
+                .expect("built-in Sherpa Qwen 1.7B model id");
+        add(
+            LocalAsrRuntime::SherpaOnnx,
+            "qwen3-asr-1.7b-int8",
+            "",
+            None,
+            "Qwen3-ASR 1.7B INT8",
+            qwen17_sherpa
+                .sherpa_family()
+                .expect("Sherpa Qwen 1.7B model family")
+                .as_str(),
+            qwen17_sherpa
+                .sherpa_execution_mode()
+                .expect("Sherpa Qwen 1.7B execution mode")
+                .as_str(),
+            &["multi"],
+            ModelFileSelector::Pinned(vec![
+                ModelFile {
+                    path: "conv_frontend.onnx".into(),
+                    url: String::new(),
+                    size_bytes: 48_080_441,
+                    sha256: None,
+                },
+                ModelFile {
+                    path: "encoder.int8.onnx".into(),
+                    url: String::new(),
+                    size_bytes: 314_222_162,
+                    sha256: None,
+                },
+                ModelFile {
+                    path: "decoder.int8.onnx".into(),
+                    url: String::new(),
+                    size_bytes: 2_037_458_645,
+                    sha256: None,
+                },
+                ModelFile {
+                    path: "tokenizer/merges.txt".into(),
+                    url: String::new(),
+                    size_bytes: 1_671_853,
+                    sha256: None,
+                },
+                ModelFile {
+                    path: "tokenizer/tokenizer_config.json".into(),
+                    url: String::new(),
+                    size_bytes: 12_487,
+                    sha256: None,
+                },
+                ModelFile {
+                    path: "tokenizer/vocab.json".into(),
+                    url: String::new(),
+                    size_bytes: 2_776_833,
+                    sha256: None,
+                },
+            ]),
+        );
         entries.extend(crate::experimental_asr::catalog_entries());
         Self { entries }
     }

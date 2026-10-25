@@ -2567,6 +2567,9 @@ export const zhTW: typeof zhCN = {
     sherpaModelZipformer: 'Zipformer 串流（中英）',
     sherpaModelZipformerDesc: '邊說邊出的串流中英模型，延遲最低，適合即時聽寫。',
     sherpaModelQwen3: 'Qwen3-ASR 0.6B INT8',
+    sherpaModelQwen317b: 'Qwen3-ASR 1.7B INT8（社區轉換）',
+    sherpaModelQwen317bDesc:
+      '社區轉換的 sherpa-onnx 1.7B 模型（本地釘住安裝，無官方下載源）：準確率更高、解碼較慢，超長音訊有複讀風險。',
     sherpaModelQwen3Desc:
       '轉換後的 sherpa-onnx Qwen3-ASR 模型，支援多語言識別與更強的長上下文能力。',
     modelSelectTitle: '模型下載與管理',
@@ -2608,6 +2611,10 @@ export const zhTW: typeof zhCN = {
     loadNow: '立即載入',
     releaseNow: '立即釋放',
     keepLoadedLabel: '保持載入多久',
+    numThreadsLabel: '推論執行緒數',
+    numThreadsDesc:
+      '留空 = 自動（邏輯執行緒的 80%，最少 1）；手動輸入會被限制在 1 到自動上限之間，模型下次載入時生效。',
+    numThreadsAuto: '自動',
     keepLoadedDesc: '決定 Qwen3-ASR 用完後多久從記憶體釋放，避免長期佔用記憶體。',
     keepImmediate: '說完話立即釋放',
     keep1min: '上次使用後 1 分鐘',

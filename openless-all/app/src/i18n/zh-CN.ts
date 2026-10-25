@@ -2569,6 +2569,9 @@ export const zhCN = {
     sherpaModelZipformer: 'Zipformer 流式（中英）',
     sherpaModelZipformerDesc: '边说边出的流式中英模型，延迟最低，适合实时听写。',
     sherpaModelQwen3: 'Qwen3-ASR 0.6B INT8',
+    sherpaModelQwen317b: 'Qwen3-ASR 1.7B INT8（社区转换）',
+    sherpaModelQwen317bDesc:
+      '社区转换的 sherpa-onnx 1.7B 模型（本地钉住安装，无官方下载源）：准确率更高、解码较慢，超长音频有复读风险。',
     sherpaModelQwen3Desc:
       '转换后的 sherpa-onnx Qwen3-ASR 模型，支持多语言识别与更强的长上下文能力。',
     modelSelectTitle: '本机模型',
@@ -2611,6 +2614,10 @@ export const zhCN = {
     keepLoadedLabel: '保持加载多久',
     keepLoadedDesc:
       '决定当前本地 ASR 引擎在下次转写后保持加载多久；“不释放”会持续驻留至手动释放或退出。',
+    numThreadsLabel: '推理线程数',
+    numThreadsDesc:
+      '留空 = 自动（逻辑线程的 80%，最少 1）；手动输入会被限制在 1 到自动上限之间，模型下次加载时生效。',
+    numThreadsAuto: '自动',
     keepImmediate: '说完话立即释放',
     keep1min: '上次使用后 1 分钟',
     keep5min: '上次使用后 5 分钟（默认）',

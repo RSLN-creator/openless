@@ -705,6 +705,13 @@ pub const PREFERENCE_FIELDS: &[PreferenceField] = &[
         reason: "device_bound",
     },
     PreferenceField {
+        rust_name: "sherpa_onnx_num_threads",
+        key: "sherpaOnnxNumThreads",
+        class: PreferenceClass::Excluded,
+        shape: PreferenceShape::Unsigned32,
+        reason: "device_bound",
+    },
+    PreferenceField {
         rust_name: "local_asr_fallback_enabled",
         key: "localAsrFallbackEnabled",
         class: PreferenceClass::DeviceProfile,

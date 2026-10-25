@@ -188,6 +188,8 @@ const SHERPA_MODEL_ALIASES: &[&str] = &[
     "whisper-small-multi",
     "whisper-large-v3-multi",
     "qwen3-asr-0.6b-int8",
+    // 社区转换的 1.7B 本地钉住模型（无官方下载源），拉取/适配方法见 docs/sherpa-model-slot-guide.md
+    "qwen3-asr-1.7b-int8",
     "zipformer-bilingual-zh-en-streaming",
 ];
 
@@ -238,6 +240,7 @@ impl LocalAsrTarget {
             "paraformer-zh" => Some(SherpaModelFamily::Paraformer),
             "whisper-small-multi" | "whisper-large-v3-multi" => Some(SherpaModelFamily::Whisper),
             "qwen3-asr-0.6b-int8" => Some(SherpaModelFamily::Qwen3Asr),
+            "qwen3-asr-1.7b-int8" => Some(SherpaModelFamily::Qwen3Asr),
             "zipformer-bilingual-zh-en-streaming" => Some(SherpaModelFamily::Zipformer),
             _ => None,
         }

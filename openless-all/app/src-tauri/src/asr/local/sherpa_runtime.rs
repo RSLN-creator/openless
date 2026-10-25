@@ -527,13 +527,29 @@ async fn load_model(alias: &str, _dir: &Path) -> Result<LoadedModel> {
     }
 }
 
+/// Inference threads: user override clamped to [1, 80% of logical CPU
+/// threads]; no override = auto (80% of logical CPU threads, min 1).
+#[cfg(local_asr_sherpa)]
+fn resolve_num_threads() -> i32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let cap = ((((cores as f64) * 0.8).floor() as i32).clamp(1, cores as i32)).max(1);
+    match openless_core::shared_types::sherpa_num_threads_override() {
+        Some(value) => (value as i32).clamp(1, cap),
+        None => cap,
+    }
+}
+
 #[cfg(local_asr_sherpa)]
 fn create_offline_recognizer(alias: &str, dir: &Path) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
-    config.model_config.num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(1, 4) as i32)
-        .unwrap_or(2);
+    config.model_config.num_threads = resolve_num_threads();
     config.model_config.provider = Some("cpu".into());
+    log::info!(
+        "[sherpa-asr] offline recognizer num_threads={}",
+        config.model_config.num_threads
+    );
     match sherpa_target(alias)?.sherpa_family() {
         Some(openless_core::SherpaModelFamily::SenseVoice) => {
             config.model_config.tokens = Some(path_to_string(&dir.join("tokens.txt"))?);
@@ -570,7 +586,6 @@ fn create_offline_recognizer(alias: &str, dir: &Path) -> Result<OfflineRecognize
                 max_new_tokens: QWEN3_ASR_MAX_NEW_TOKENS,
                 ..Default::default()
             };
-            config.model_config.num_threads = 3;
         }
         Some(openless_core::SherpaModelFamily::Zipformer) => {
             anyhow::bail!("zipformer is not supported by offline batch M2")

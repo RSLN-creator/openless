@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! Shared value types used by every OpenLess host.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::android_types::{
@@ -734,6 +736,11 @@ pub struct UserPreferences {
     /// (seconds); same semantics as foundry/qwen3.
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub sherpa_onnx_keep_loaded_secs: u32,
+    /// Windows sherpa-onnx inference thread count. `None` = auto
+    /// (80% of logical CPU threads, min 1). Always serialized so the
+    /// settings JSON-pointer patch stays valid when the value is unset.
+    #[serde(default)]
+    pub sherpa_onnx_num_threads: Option<u32>,
     /// When a cloud ASR provider fails, transcribe the recorded audio with the
     /// selected sherpa-onnx model instead (weak or no network). Off by default;
     /// only takes effect where local ASR is supported and a model is installed.
@@ -988,6 +995,23 @@ fn default_sherpa_onnx_model() -> String {
     crate::local_asr_catalog::SHERPA_DEFAULT_MODEL_ALIAS.into()
 }
 
+static SHERPA_NUM_THREADS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+
+/// Push the sherpa-onnx thread preference into the atomic consumed by the
+/// Windows sherpa runtime. `None` (or 0) selects auto: 80% of logical CPU
+/// threads, minimum 1.
+pub fn set_sherpa_num_threads_override(value: Option<u32>) {
+    SHERPA_NUM_THREADS_OVERRIDE.store(value.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Current manual sherpa-onnx thread override; `None` = auto.
+pub fn sherpa_num_threads_override() -> Option<u32> {
+    match SHERPA_NUM_THREADS_OVERRIDE.load(Ordering::Relaxed) {
+        0 => None,
+        value => Some(value),
+    }
+}
+
 fn default_active_asr_provider() -> String {
     #[cfg(target_os = "windows")]
     {
@@ -1183,6 +1207,8 @@ struct UserPreferencesWire {
     sherpa_onnx_language_hint: String,
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     sherpa_onnx_keep_loaded_secs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sherpa_onnx_num_threads: Option<u32>,
     #[serde(default)]
     local_asr_fallback_enabled: bool,
     #[serde(default)]
@@ -1395,6 +1421,7 @@ impl Default for UserPreferencesWire {
             sherpa_onnx_model: prefs.sherpa_onnx_model,
             sherpa_onnx_language_hint: prefs.sherpa_onnx_language_hint,
             sherpa_onnx_keep_loaded_secs: prefs.sherpa_onnx_keep_loaded_secs,
+            sherpa_onnx_num_threads: prefs.sherpa_onnx_num_threads,
             local_asr_fallback_enabled: prefs.local_asr_fallback_enabled,
             update_channel: prefs.update_channel,
             // None preserves the fact that the old config lacked the marker; deserialization treats only historical Beta as explicit.
@@ -1510,6 +1537,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
                 });
 
         Ok(Self {
+            sherpa_onnx_num_threads: wire.sherpa_onnx_num_threads,
             hotkey: wire.hotkey,
             dictation_hotkey,
             default_mode: wire.default_mode,
@@ -1909,6 +1937,7 @@ fn default_working_languages() -> Vec<String> {
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
+            sherpa_onnx_num_threads: None,
             hotkey: HotkeyBinding::default(),
             dictation_hotkey: default_dictation_hotkey_from_legacy(
                 &HotkeyBinding::default(),

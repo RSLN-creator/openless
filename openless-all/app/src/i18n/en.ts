@@ -2728,6 +2728,9 @@ export const en: typeof zhCN = {
     sherpaModelZipformerDesc:
       'Streaming Chinese-English model with the lowest latency — text appears as you speak.',
     sherpaModelQwen3: 'Qwen3-ASR 0.6B INT8',
+    sherpaModelQwen317b: 'Qwen3-ASR 1.7B INT8 (community)',
+    sherpaModelQwen317bDesc:
+      'Community-converted sherpa-onnx 1.7B model (locally pinned, no official download source): higher accuracy, slower decode, repetition risk on long audio.',
     sherpaModelQwen3Desc:
       'Converted sherpa-onnx Qwen3-ASR model with multilingual recognition and stronger long-form context handling.',
     modelSelectTitle: 'Models on this device',
@@ -2773,6 +2776,10 @@ export const en: typeof zhCN = {
     keepLoadedLabel: 'Keep loaded for',
     keepLoadedDesc:
       'How long the current local ASR engine stays loaded after the next transcription; Never release keeps it loaded until manual release or exit.',
+    numThreadsLabel: 'Inference threads',
+    numThreadsDesc:
+      'Empty = auto (80% of logical threads, min 1). Manual values are clamped to 1..auto cap and apply when the model next loads.',
+    numThreadsAuto: 'Auto',
     keepImmediate: 'Release immediately',
     keep1min: '1 minute after last use',
     keep5min: '5 minutes after last use (default)',

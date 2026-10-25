@@ -534,6 +534,8 @@ export interface UserPreferences {
   sherpaOnnxLanguageHint: string;
   /** Seconds the Windows sherpa-onnx model stays loaded in the runtime. */
   sherpaOnnxKeepLoadedSecs: number;
+  /** Windows sherpa-onnx inference threads. null/undefined = auto (80% of logical threads, min 1). */
+  sherpaOnnxNumThreads?: number | null;
   /** When a cloud ASR provider fails, transcribe the recording with the selected sherpa-onnx model. */
   localAsrFallbackEnabled: boolean;
   /** History retention days. 0 = no time-based cleanup (the 200-entry cap still applies). Default 7. */

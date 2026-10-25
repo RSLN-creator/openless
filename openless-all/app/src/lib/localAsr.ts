@@ -484,7 +484,8 @@ export type SherpaOnnxModelAlias =
   | 'whisper-small-multi'
   | 'whisper-large-v3-multi'
   | 'zipformer-bilingual-zh-en-streaming'
-  | 'qwen3-asr-0.6b-int8';
+  | 'qwen3-asr-0.6b-int8'
+  | 'qwen3-asr-1.7b-int8';
 
 export type SherpaOnnxMirror = 'huggingface' | 'hf-mirror' | 'github-release';
 
@@ -541,6 +542,11 @@ export const SHERPA_ONNX_ASR_MODELS: SherpaOnnxModelOption[] = [
     alias: 'qwen3-asr-0.6b-int8',
     labelKey: 'localAsr.sherpaModelQwen3',
     descKey: 'localAsr.sherpaModelQwen3Desc',
+  },
+  {
+    alias: 'qwen3-asr-1.7b-int8',
+    labelKey: 'localAsr.sherpaModelQwen317b',
+    descKey: 'localAsr.sherpaModelQwen317bDesc',
   },
 ];
 

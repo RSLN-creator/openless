@@ -2818,6 +2818,9 @@ export const fr: typeof zhCN = {
     sherpaModelZipformerDesc:
       'Modèle streaming chinois-anglais à la latence la plus faible — le texte apparaît pendant que vous parlez.',
     sherpaModelQwen3: 'Qwen3-ASR 0.6B INT8',
+    sherpaModelQwen317b: 'Qwen3-ASR 1.7B INT8 (communauté)',
+    sherpaModelQwen317bDesc:
+      'Modèle sherpa-onnx 1.7B converti par la communauté (épinglé localement, pas de source de téléchargement officielle) : plus précis, décodage plus lent, risque de répétition sur les longs audios.',
     sherpaModelQwen3Desc:
       'Modèle Qwen3-ASR converti pour sherpa-onnx, avec reconnaissance multilingue et meilleure gestion du contexte long.',
     modelSelectTitle: 'Modèles sur cet appareil',
@@ -2862,6 +2865,10 @@ export const fr: typeof zhCN = {
     loadNow: 'Charger maintenant',
     releaseNow: 'Libérer maintenant',
     keepLoadedLabel: 'Conserver en mémoire pendant',
+    numThreadsLabel: 'Threads d’inférence',
+    numThreadsDesc:
+      'Vide = automatique (80 % des threads logiques, min. 1). Les valeurs manuelles sont limitées à 1..plafond auto et s’appliquent au prochain chargement du modèle.',
+    numThreadsAuto: 'Auto',
     keepLoadedDesc:
       'Durée de chargement du moteur ASR local actuel après la prochaine transcription ; « Ne jamais libérer » le conserve jusqu’à une libération manuelle ou la fermeture.',
     keepImmediate: 'Libérer immédiatement',

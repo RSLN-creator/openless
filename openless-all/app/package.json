@@ -37,6 +37,11 @@
     "build:native-capsule": "node scripts/build-native-capsule.mjs",
     "build:native-capsule:dev": "node scripts/build-native-capsule.mjs --debug"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
     "@shadcn/react": "^0.2.1",

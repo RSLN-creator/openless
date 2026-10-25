@@ -2672,6 +2672,9 @@ export const ko: typeof zhCN = {
     sherpaModelZipformerDesc:
       '말하는 동안 텍스트가 나오는 스트리밍 중·영어 모델로, 지연이 가장 낮아 실시간 받아쓰기에 적합합니다.',
     sherpaModelQwen3: 'Qwen3-ASR 0.6B INT8',
+    sherpaModelQwen317b: 'Qwen3-ASR 1.7B INT8(커뮤니티)',
+    sherpaModelQwen317bDesc:
+      '커뮤니티 변환 sherpa-onnx 1.7B 모델(로컬 고정 설치, 공식 다운로드 원본 없음): 정확도는 높지만 디코딩이 느리고 긴 오디오에서 반복 열화 위험이 있습니다.',
     sherpaModelQwen3Desc:
       '변환된 sherpa-onnx Qwen3-ASR 모델로 다국어 인식과 더 강한 긴 문맥 처리를 지원합니다.',
     modelSelectTitle: '이 기기의 모델',
@@ -2714,6 +2717,10 @@ export const ko: typeof zhCN = {
     loadNow: '지금 로드',
     releaseNow: '지금 해제',
     keepLoadedLabel: '로드 유지 시간',
+    numThreadsLabel: '추론 스레드 수',
+    numThreadsDesc:
+      '비워 두면 자동(논리 스레드의 80%, 최소 1). 수동 값은 1~자동 상한으로 제한되며 다음 모델 로드 시 적용됩니다.',
+    numThreadsAuto: '자동',
     keepLoadedDesc:
       '현재 로컬 ASR 엔진을 다음 전사 후 얼마나 유지할지 정합니다. 해제하지 않음은 수동 해제 또는 종료까지 유지합니다.',
     keepImmediate: '말하기 직후 해제',
