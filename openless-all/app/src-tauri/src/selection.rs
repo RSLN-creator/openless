@@ -519,6 +519,14 @@ pub(crate) fn reactivate_selection_insertion_target(target: &SelectionInsertionT
         let Some(captured) = target.windows else {
             return false;
         };
+        // Streaming writes almost always still own the foreground application, so pay the
+        // 80ms activation wait only when focus actually moved. This mirrors the macOS fast
+        // path below (see the "Streaming writes usually already own the foreground
+        // application" comment): without it every delta of a streaming insertion pays a
+        // fixed ~80ms stall, which is very visible on short batches.
+        if capture_windows_selection_target().as_ref() == Some(&captured) {
+            return true;
+        }
         unsafe {
             let foreground = HWND(captured.foreground_window as *mut _);
             if IsIconic(foreground).as_bool() {

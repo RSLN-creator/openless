@@ -595,7 +595,43 @@ mod windows_impl {
         text: &str,
         options: WindowsSendInputOptions,
     ) -> Result<usize, TypeError> {
+        // The timer period is raised for the whole insertion session by
+        // `TimerResolutionSession`; see its doc comment for why it is not scoped to this call.
         type_unicode_chunk_with_sender(text, options, send_character)
+    }
+
+    /// Scoped `timeBeginPeriod(1)` so the per-keystroke sleeps land near 1ms instead of being
+    /// quantized to the default ~15.6ms scheduler tick. Restores the previous period on drop,
+    /// including on the error paths, and is a no-op when the call fails.
+    ///
+    /// Held for a whole streaming insertion session, not per write: raising and dropping the
+    /// period around every chunk would land each chunk's first `sleep(1ms)` on a fresh coarse
+    /// tick. See `TimerResolutionSession` for the owner.
+    pub(crate) struct TimerResolutionGuard {
+        active: bool,
+    }
+
+    impl TimerResolutionGuard {
+        pub(crate) fn raise_to_1ms() -> Self {
+            use windows::Win32::Media::timeBeginPeriod;
+            let status = unsafe { timeBeginPeriod(1) };
+            log::info!("[unicode-keystroke] timeBeginPeriod(1) status={status}");
+            Self {
+                active: status == 0,
+            }
+        }
+    }
+
+    impl Drop for TimerResolutionGuard {
+        fn drop(&mut self) {
+            if self.active {
+                use windows::Win32::Media::timeEndPeriod;
+                unsafe {
+                    let _ = timeEndPeriod(1);
+                }
+                log::info!("[unicode-keystroke] timeEndPeriod(1) restored");
+            }
+        }
     }
 
     fn type_unicode_chunk_with_sender(
@@ -637,9 +673,17 @@ mod windows_impl {
             }
             typed_chars += 1;
             sent_in_chunk += 1;
-            // Sleep after every event, including the final event in this write. The latter is
-            // what preserves a gap when streaming reconciliation starts the next write later.
-            sleep(INTER_KEYSTROKE_DELAY);
+            // A CJK character is a whole word by itself, so it keeps its own gap. The letters
+            // of a Latin word belong together: gapping after every letter makes an eight-letter
+            // English word crawl out one letter at a time, so the gap is deferred to the end of
+            // the word and the word lands as one unit. Digits join the run for the same reason
+            // ("2026" reads as one token, not four).
+            if !continues_latin_word(ch, chars.peek().copied()) {
+                // Sleep after every remaining unit, including the final unit in this write. The
+                // latter is what preserves a gap when streaming reconciliation starts the next
+                // write later.
+                sleep(INTER_KEYSTROKE_DELAY);
+            }
 
             if sent_in_chunk >= SENDINPUT_CHUNK_CHARS && chars.peek().is_some() {
                 sleep(SENDINPUT_CHUNK_DELAY);
@@ -647,6 +691,14 @@ mod windows_impl {
             }
         }
         Ok(typed_chars)
+    }
+
+    /// Whether `ch` is an inner letter of a Latin word, i.e. the next character continues the
+    /// same word. Such a character must not be followed by an inter-keystroke gap: the gap is
+    /// paid once, after the word's last letter, so the word appears as a unit instead of being
+    /// revealed letter by letter.
+    fn continues_latin_word(ch: char, next: Option<char>) -> bool {
+        ch.is_ascii_alphanumeric() && next.is_some_and(|next| next.is_ascii_alphanumeric())
     }
 
     fn send_character(ch: char, options: WindowsSendInputOptions) -> Result<(), TypeError> {
@@ -718,8 +770,9 @@ mod windows_impl {
         fn chunk_pause_follows_the_sixteenth_event() {
             let mut sleeps = Vec::new();
             let mut sleep = |duration| sleeps.push(duration);
+            // CJK keeps one gap per character, so this is a plain 17-unit run.
             type_unicode_chunk_with_sender_and_sleeper(
-                &"x".repeat(17),
+                &"中".repeat(17),
                 WindowsSendInputOptions::default(),
                 |_, _| Ok(()),
                 &mut sleep,
@@ -730,6 +783,96 @@ mod windows_impl {
             assert!(sleeps[..16].iter().all(|gap| *gap == INTER_KEYSTROKE_DELAY));
             assert_eq!(sleeps[16], SENDINPUT_CHUNK_DELAY);
             assert_eq!(sleeps[17], INTER_KEYSTROKE_DELAY);
+        }
+
+        /// A Latin word is one visual unit: the eight letters of "openless" must cost one gap,
+        /// not eight, so the word appears whole instead of being revealed letter by letter.
+        #[test]
+        fn latin_word_costs_one_gap_instead_of_one_per_letter() {
+            let mut sent = String::new();
+            let mut sleeps = Vec::new();
+            let mut send = |ch, _| {
+                sent.push(ch);
+                Ok(())
+            };
+            let mut sleep = |duration| sleeps.push(duration);
+
+            type_unicode_chunk_with_sender_and_sleeper(
+                "openless",
+                WindowsSendInputOptions::default(),
+                &mut send,
+                &mut sleep,
+            )
+            .unwrap();
+
+            assert_eq!(sent, "openless");
+            assert_eq!(sleeps, vec![INTER_KEYSTROKE_DELAY]);
+        }
+
+        /// CJK still paces one gap per character: every glyph is a word of its own.
+        #[test]
+        fn cjk_still_paces_one_gap_per_character() {
+            let mut sleeps = Vec::new();
+            let mut sleep = |duration| sleeps.push(duration);
+            type_unicode_chunk_with_sender_and_sleeper(
+                "你好世界",
+                WindowsSendInputOptions::default(),
+                |_, _| Ok(()),
+                &mut sleep,
+            )
+            .unwrap();
+
+            assert_eq!(sleeps, vec![INTER_KEYSTROKE_DELAY; 4]);
+        }
+
+        /// Mixed script: each run is paced on its own, and the boundary between them still
+        /// keeps the gap that protects the first character after a CJK→ASCII switch.
+        #[test]
+        fn mixed_script_paces_each_run_separately() {
+            let mut sleeps = Vec::new();
+            let mut sleep = |duration| sleeps.push(duration);
+            type_unicode_chunk_with_sender_and_sleeper(
+                "打开openless",
+                WindowsSendInputOptions::default(),
+                |_, _| Ok(()),
+                &mut sleep,
+            )
+            .unwrap();
+
+            // 打 and 开 each pay a gap; the seven inner letters of "openless" pay none, so the
+            // whole run costs three gaps and the word still lands as one unit.
+            assert_eq!(sleeps.len(), 3);
+            assert!(sleeps.iter().all(|gap| *gap == INTER_KEYSTROKE_DELAY));
+        }
+
+        /// A space-separated sentence pays one gap per word, not per letter.
+        #[test]
+        fn spaced_words_pay_one_gap_per_word() {
+            let mut sleeps = Vec::new();
+            let mut sleep = |duration| sleeps.push(duration);
+            type_unicode_chunk_with_sender_and_sleeper(
+                "the quick brown",
+                WindowsSendInputOptions::default(),
+                |_, _| Ok(()),
+                &mut sleep,
+            )
+            .unwrap();
+
+            // the / quick / brown pay one gap each once their last letter lands, and the two
+            // spaces are boundaries of their own, so five gaps in total.
+            assert_eq!(sleeps.len(), 5);
+        }
+
+        #[test]
+        fn latin_word_detection_covers_digits_and_boundaries() {
+            assert!(continues_latin_word('a', Some('b')));
+            assert!(continues_latin_word('2', Some('6')));
+            assert!(continues_latin_word('a', Some('2')));
+            assert!(!continues_latin_word('a', Some(' ')));
+            assert!(!continues_latin_word('a', Some('中')));
+            assert!(!continues_latin_word('a', None));
+            assert!(!continues_latin_word('中', Some('文')));
+            assert!(!continues_latin_word(' ', Some('a')));
         }
 
         #[test]
@@ -1154,6 +1297,54 @@ pub fn expected_sendinput_typed_chars(text: &str) -> usize {
 // ═══════════════════════════════════════════════════════════════════════════
 // Public re-exports (cfg-dispatched to the matching implementation)
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Holds a raised Windows timer period for one streaming insertion session.
+///
+/// `INTER_KEYSTROKE_DELAY` is 1ms per character, which is what makes a streamed sentence
+/// read as continuous typing rather than as a jump every time the polish model emits a
+/// delta. At the default 15.625ms system timer tick `thread::sleep(1ms)` actually sleeps a
+/// full tick, so the same sentence takes ~6x longer and the caret visibly stalls between
+/// chunks. The period is raised once when the session starts and dropped when it ends
+/// rather than around each write, because re-raising it per chunk would put every chunk's
+/// first sleep back on a coarse tick.
+///
+/// Dropping restores the period on every path, including cancellation and error.
+#[cfg(target_os = "windows")]
+pub struct TimerResolutionSession {
+    guard: Option<windows_impl::TimerResolutionGuard>,
+}
+
+#[cfg(target_os = "windows")]
+impl TimerResolutionSession {
+    /// Raises the period to 1ms. Only worth taking when text will actually be typed; a
+    /// copy-only or TSF-composition session does not sleep per keystroke.
+    pub fn raise() -> Self {
+        Self {
+            guard: Some(windows_impl::TimerResolutionGuard::raise_to_1ms()),
+        }
+    }
+
+    /// Session that will not post per-character Unicode keystrokes, so the timer period is
+    /// left alone.
+    pub fn raise_noop() -> Self {
+        Self { guard: None }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub struct TimerResolutionSession;
+
+#[cfg(not(target_os = "windows"))]
+impl TimerResolutionSession {
+    pub fn raise() -> Self {
+        Self
+    }
+
+    pub fn raise_noop() -> Self {
+        Self
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unused_imports)]
 pub use macos_impl::{

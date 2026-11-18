@@ -4029,6 +4029,18 @@ where
     result
 }
 
+/// Whether this session delivers text by posting per-character Unicode keystrokes.
+///
+/// Only that path sleeps between characters (`INTER_KEYSTROKE_DELAY`), so only that path
+/// benefits from a finer system timer tick. TSF composition and clipboard delivery post one
+/// update or one paste instead and must not hold a raised timer period.
+#[cfg(target_os = "windows")]
+fn uses_sendinput_keystrokes(context: &DictationContext) -> bool {
+    !context.insertion.composition_input
+        && context.insertion.windows_insertion_mode
+            == openless_core::shared_types::WindowsInsertionMode::SendInput
+}
+
 impl CoreTextInserter for TauriTextInserter {
     fn capture_target(&self) -> Option<CapturedTextTarget> {
         let insertion_target = crate::selection::capture_selection_insertion_target();
@@ -4123,12 +4135,23 @@ impl CoreTextInserter for TauriTextInserter {
             };
             #[cfg(not(target_os = "macos"))]
             let _ = app;
+            // Only a SendInput session sleeps between characters, so only it benefits from a
+            // finer timer tick. TSF composition and clipboard delivery never see the 1ms gap.
+            #[cfg(target_os = "windows")]
+            let timer_resolution = if uses_sendinput_keystrokes(&context) {
+                crate::unicode_keystroke::TimerResolutionSession::raise()
+            } else {
+                crate::unicode_keystroke::TimerResolutionSession::raise_noop()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let timer_resolution = crate::unicode_keystroke::TimerResolutionSession::raise_noop();
             let session = Arc::new(TauriTextInsertionSession {
                 session_id,
                 backend,
                 context,
                 insertion_target,
                 finished: Arc::new(AtomicBool::new(false)),
+                timer_resolution: Arc::new(timer_resolution),
                 #[cfg(target_os = "windows")]
                 windows_ime,
                 #[cfg(target_os = "windows")]
@@ -4183,6 +4206,10 @@ struct TauriTextInsertionSession {
     context: Arc<DictationContext>,
     insertion_target: crate::selection::SelectionInsertionTarget,
     finished: Arc<AtomicBool>,
+    /// Raised Windows timer period for the length of this session, so the per-character
+    /// streaming gap is not quantized to the default system tick. Shared by `Arc` so cloning
+    /// the session does not request the period twice; dropping the last handle restores it.
+    timer_resolution: Arc<crate::unicode_keystroke::TimerResolutionSession>,
     #[cfg(target_os = "windows")]
     windows_ime: Arc<crate::windows_ime_session::WindowsImeSessionController>,
     #[cfg(target_os = "windows")]
@@ -4600,6 +4627,7 @@ impl TauriTextInsertionSession {
                 if finished.load(Ordering::Acquire) {
                     return 0;
                 }
+                let started = std::time::Instant::now();
                 #[cfg(target_os = "windows")]
                 let result = crate::unicode_keystroke::type_unicode_chunk_with_options(
                     &chunk,
@@ -4609,6 +4637,11 @@ impl TauriTextInsertionSession {
                     Ok(written) => written,
                     Err(error) => error.typed_chars(),
                 };
+                log::info!(
+                    "[insert-timing] sendinput chunks={} chars={written} elapsed_ms={}",
+                    chunk.chars().count(),
+                    started.elapsed().as_millis()
+                );
                 written
             })
             .await
