@@ -587,6 +587,18 @@ mod windows_impl {
         }
     }
 
+    /// Characters per reveal step. The pacer writes one group, then waits, so the text
+    /// appears in a steady trickle instead of a burst.
+    const PACING_GROUP_CHARS: usize = 2;
+
+    /// Wait between reveal steps.
+    ///
+    /// The inner loop already pauses 1ms per keystroke, but a 60Hz compositor cannot show
+    /// anything finer than ~16ms, so a whole sentence sent at that speed reaches the screen
+    /// as one paint and reads as a single block. 8ms per two characters keeps the reveal
+    /// visible while staying fast enough for a long dictation.
+    const PACING_GROUP_DELAY: Duration = Duration::from_millis(8);
+
     pub fn type_unicode_chunk(text: &str) -> Result<usize, TypeError> {
         type_unicode_chunk_with_options(text, WindowsSendInputOptions::default())
     }
@@ -597,7 +609,32 @@ mod windows_impl {
     ) -> Result<usize, TypeError> {
         // The timer period is raised for the whole insertion session by
         // `TimerResolutionSession`; see its doc comment for why it is not scoped to this call.
-        type_unicode_chunk_with_sender(text, options, send_character)
+        //
+        // The pacer splits the write into reveal steps and waits between them. Splitting here
+        // rather than in the loop keeps the per-keystroke contract (and its tests) untouched:
+        // each step is still an ordinary `type_unicode_chunk_with_sender` call.
+        let mut typed_chars = 0;
+        let mut rest = text;
+        while !rest.is_empty() {
+            let end = rest
+                .char_indices()
+                .map(|(index, _)| index)
+                .nth(PACING_GROUP_CHARS)
+                .unwrap_or(rest.len());
+            let (group, tail) = rest.split_at(end);
+            match type_unicode_chunk_with_sender(group, options, send_character) {
+                Ok(typed) => typed_chars += typed,
+                Err(TypeError::Partial { typed_chars: done, source }) => {
+                    return Err(partial_or_original(typed_chars + done, *source));
+                }
+                Err(error) => return Err(partial_or_original(typed_chars, error)),
+            }
+            rest = tail;
+            if !rest.is_empty() {
+                std::thread::sleep(PACING_GROUP_DELAY);
+            }
+        }
+        Ok(typed_chars)
     }
 
     /// Scoped `timeBeginPeriod(1)` so the per-keystroke sleeps land near 1ms instead of being
@@ -720,6 +757,60 @@ mod windows_impl {
     #[cfg(test)]
     mod consumption_tests {
         use super::*;
+
+        /// The pacer splits a write into groups of [`PACING_GROUP_CHARS`] and keeps the text
+        /// intact: every scalar is typed exactly once, in order, and no group splits a
+        /// character. A split character would arrive as U+FFFD in the host.
+        #[test]
+        fn pacer_keeps_every_scalar_in_order_without_splitting_characters() {
+            let text = "中文ab🙂\r\n结尾";
+            let mut groups = Vec::new();
+            let mut rest = text;
+            while !rest.is_empty() {
+                let end = rest
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .nth(PACING_GROUP_CHARS)
+                    .unwrap_or(rest.len());
+                let (group, tail) = rest.split_at(end);
+                groups.push(group.to_string());
+                rest = tail;
+            }
+
+            // Groups are non-empty, at most PACING_GROUP_CHARS scalars, and reassemble the
+            // input exactly.
+            assert!(groups.iter().all(|group| !group.is_empty()));
+            for group in &groups {
+                assert!(
+                    group.chars().count() <= PACING_GROUP_CHARS,
+                    "group {group:?} exceeds the reveal step"
+                );
+            }
+            assert_eq!(groups.concat(), text);
+
+            // A multi-byte scalar must never land on a boundary.
+            for group in &groups {
+                for ch in group.chars() {
+                    assert_ne!(ch, '\u{FFFD}', "character split across reveal steps");
+                }
+            }
+
+            // A 2-scalar step over 9 scalars needs 5 groups, not one.
+            assert_eq!(groups.len(), 5);
+        }
+
+        /// The pacer must not change the consumed-scalar contract: it reports the same
+        /// prefix length a single unbatched write would.
+        #[test]
+        fn pacer_preserves_the_consumed_prefix_contract() {
+            let consumed = type_unicode_chunk_with_sender(
+                "a\r\n🙂",
+                WindowsSendInputOptions::default(),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(consumed, 4);
+        }
 
         #[test]
         fn crlf_and_emoji_report_the_consumed_source_prefix() {
