@@ -608,6 +608,8 @@ if (!/window\.set_size\(LogicalSize::new\(bounds\.width, bounds\.height\)\)\?/.t
   throw new Error('capsule positioning should resync runtime size with the computed layout');
 }
 
-if (!/let _ = window\.hide\(\);/.test(coordinatorRs)) {
+if (
+  !/(let _ = window\.hide\(\);|hide_window_with_webview\(&window\);)/.test(coordinatorRs)
+) {
   throw new Error('capsule should be hidden once it leaves active states');
 }

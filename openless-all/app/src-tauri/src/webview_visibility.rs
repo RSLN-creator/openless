@@ -26,6 +26,7 @@ use tauri::WebviewWindow;
 /// still reporting itself visible — Tauri forwards `visible` to the window layer
 /// only — so without this pass those windows would keep a renderer resident from
 /// process start, before any hide path runs.
+#[cfg(target_os = "windows")]
 pub(crate) fn sync_hidden_windows<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager;
     for (label, window) in app.webview_windows() {
