@@ -1002,6 +1002,7 @@ impl TauriCapsuleWindow {
     /// revealing afterwards produces a blank first frame. Keeping the window
     /// _visible but off-screen_ lets Chromium lay out, resize and paint the
     /// card; only a settled frame is then moved on-screen.
+    #[cfg(target_os = "windows")]
     pub(crate) fn prepare_fallback_card_window(&self) {
         self.stop_layout_watch();
         self.hide_transcript_overlay();
@@ -1059,12 +1060,14 @@ impl TauriCapsuleWindow {
     /// The reveal timeout uses this to avoid repositioning a card that the
     /// measured-height path already placed: the timeout only knows the probe
     /// height, so applying it late would shift a visible card.
+    #[cfg(target_os = "windows")]
     pub(crate) fn fallback_card_already_revealed(&self) -> bool {
         self.state.fallback_card_already_revealed()
     }
 
     /// Shows the result card once at the size the frontend measured.
     /// Returns false when this presentation was already revealed (or is stale).
+    #[cfg(target_os = "windows")]
     pub(crate) fn reveal_fallback_card(&self) -> bool {
         if !self.state.mark_fallback_card_shown() {
             return false;
