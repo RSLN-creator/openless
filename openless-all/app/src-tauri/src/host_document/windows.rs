@@ -866,6 +866,133 @@ unsafe fn observe(request: &Request) -> Result<()> {
 // its own safety gate ([`allowed_process`] + `CurrentIsPassword`) before a single UIA text
 // call is made. See `windows_cursor_context开发方案.md` §4.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InsertionPointEvidence {
+    native_caret: bool,
+    has_keyboard_focus: bool,
+    enabled: bool,
+    value_read_only: Option<bool>,
+    text_range_available: bool,
+}
+
+/// SendInput succeeding only proves that Windows accepted keystrokes, not that
+/// an editable control consumed them. A foreground window is therefore not an
+/// insertion target until its focused control supplies one of these signals.
+fn insertion_point_available(evidence: InsertionPointEvidence) -> bool {
+    if evidence.value_read_only == Some(true) || !evidence.enabled {
+        return false;
+    }
+    // `hwndCaret` comes from the foreground GUI thread and is direct evidence
+    // even when a provider omits UIA's keyboard-focus flag.
+    if evidence.native_caret {
+        return true;
+    }
+    evidence.has_keyboard_focus
+        && (evidence.value_read_only == Some(false) || evidence.text_range_available)
+}
+
+/// Probes the captured foreground control once, on the insertion preparation
+/// thread. Later chunks keep using the cheap HWND fingerprint check instead of
+/// paying for UIA on every write.
+pub(crate) fn has_insertion_point_for_target(
+    target: &crate::selection::SelectionInsertionTarget,
+) -> Option<bool> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+
+    if !crate::selection::selection_insertion_target_is_current(target) {
+        return None;
+    }
+
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let mut gui_info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let native_caret = foreground_thread != 0
+            && GetGUIThreadInfo(foreground_thread, &mut gui_info).is_ok()
+            && !gui_info.hwndCaret.0.is_null();
+
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+
+        let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let should_uninitialize = if init == RPC_E_CHANGED_MODE {
+            // COM is already initialized on this worker with another
+            // apartment model. UIA is still usable; only skip the matching
+            // CoUninitialize because this call did not create the apartment.
+            false
+        } else if init.is_ok() {
+            true
+        } else {
+            return native_caret.then_some(true);
+        };
+        struct ComGuard(bool);
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { CoUninitialize() }
+                }
+            }
+        }
+        let _com = ComGuard(should_uninitialize);
+
+        let available = (|| -> Result<bool> {
+            let uia: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+            let timeouts: IUIAutomation2 = uia.cast()?;
+            timeouts.SetConnectionTimeout(200)?;
+            timeouts.SetTransactionTimeout(200)?;
+            let element = uia.GetFocusedElement()?;
+            // Same gate order as the cursor-context reader: a password field or a
+            // blocked process is never an insertion target, regardless of caret
+            // evidence. Returning false lets the caller take the result-card path
+            // instead of sending keystrokes into it.
+            if element.CurrentIsPassword()?.as_bool() || !allowed_process(&element)? {
+                log::info!("[insert-target] rejected by password/process gate");
+                return Ok(false);
+            }
+            let has_keyboard_focus = element.CurrentHasKeyboardFocus()?.as_bool();
+            let enabled = element.CurrentIsEnabled()?.as_bool();
+            let value_read_only = element
+                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                .ok()
+                .map(|pattern| pattern.CurrentIsReadOnly())
+                .transpose()?
+                .map(|readonly| readonly.as_bool());
+            // Only a collapsed caret is insertion evidence. A non-collapsed
+            // selection is deliberately not a caret (see CaretLookup docs); treating
+            // it as one would send keys into a read-only document with text selected.
+            let text_range_available =
+                matches!(find_caret_range(&element), CaretLookup::Found(..));
+            let available = insertion_point_available(InsertionPointEvidence {
+                native_caret,
+                has_keyboard_focus,
+                enabled,
+                value_read_only,
+                text_range_available,
+            });
+            log::info!(
+                "[insert-target] available={available} native_caret={native_caret} focused={has_keyboard_focus} enabled={enabled} value_read_only={value_read_only:?} text_range={text_range_available}"
+            );
+            Ok(available)
+        })();
+
+        if !crate::selection::selection_insertion_target_is_current(target) {
+            return None;
+        }
+        match available {
+            Ok(available) => Some(available),
+            // An unsupported/hung UIA provider is unknown, not proof that no
+            // caret exists. Only a native caret can preserve legacy insertion
+            // in that case; otherwise the ordinary target check remains the
+            // final authority instead of inventing a fallback card.
+            Err(_) => native_caret.then_some(true),
+        }
+    }
+}
+
 /// Outcome of locating a usable caret [`IUIAutomationTextRange`].
 enum CaretLookup {
     /// A zero-length (collapsed) range at the insertion point, tagged with which pattern
@@ -1134,6 +1261,69 @@ pub(super) fn read_around_cursor_blocking(
         })();
 
         outcome.unwrap_or(super::ReadOutcome::Unavailable("UIA call failed"))
+    }
+}
+
+#[cfg(test)]
+mod insertion_point_tests {
+    use super::*;
+
+    fn evidence() -> InsertionPointEvidence {
+        InsertionPointEvidence {
+            native_caret: false,
+            has_keyboard_focus: true,
+            enabled: true,
+            value_read_only: None,
+            text_range_available: false,
+        }
+    }
+
+    #[test]
+    fn editable_value_text_range_and_native_caret_are_all_insertion_points() {
+        for update in [
+            (Some(false), false, false),
+            (None, true, false),
+            (None, false, true),
+        ] {
+            let mut evidence = evidence();
+            evidence.value_read_only = update.0;
+            evidence.text_range_available = update.1;
+            evidence.native_caret = update.2;
+            assert!(insertion_point_available(evidence));
+        }
+    }
+
+    #[test]
+    fn a_focused_nontext_control_is_not_an_insertion_point() {
+        assert!(!insertion_point_available(evidence()));
+    }
+
+    #[test]
+    fn read_only_and_disabled_controls_are_rejected() {
+        for update in [(Some(true), true), (None, false)] {
+            let mut evidence = evidence();
+            evidence.value_read_only = update.0;
+            evidence.enabled = update.1;
+            evidence.text_range_available = true;
+            evidence.native_caret = true;
+            assert!(!insertion_point_available(evidence));
+        }
+    }
+
+    #[test]
+    fn native_caret_is_direct_evidence_without_the_uia_focus_flag() {
+        let mut evidence = evidence();
+        evidence.native_caret = true;
+        evidence.has_keyboard_focus = false;
+        assert!(insertion_point_available(evidence));
+    }
+
+    #[test]
+    fn uia_text_requires_keyboard_focus() {
+        let mut evidence = evidence();
+        evidence.value_read_only = Some(false);
+        evidence.has_keyboard_focus = false;
+        assert!(!insertion_point_available(evidence));
     }
 }
 

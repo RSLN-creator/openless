@@ -123,6 +123,8 @@ mod unicode_keystroke;
 mod update_source;
 #[cfg(target_os = "windows")]
 mod windows_ime_ipc;
+#[cfg(not(mobile))]
+mod webview_visibility;
 mod windows_ime_profile;
 #[cfg(target_os = "windows")]
 mod windows_ime_protocol;
@@ -884,7 +886,14 @@ fn run_desktop() {
     // Runtime effects follow Core startup/recovery
     // in tauri_events::start; pending restore must not mutate the old vault here.
     let mut context = tauri::generate_context!();
-    desktop_resources::configure(&mut context, false);
+desktop_resources::configure(
+        &mut context,
+        false,
+        // A rail that is switched off must not be built: it is a separate webview and
+        // therefore a separate renderer process, resident from launch whether or not
+        // it is ever shown.
+        core_backend.get_preferences().capsule_transcript_enabled,
+    );
     let builder = tauri::Builder::default();
     // macOS: the capsule must overlay other apps' fullscreen Spaces, which requires a
     // non-activating NSPanel (a plain NSWindow cannot do this even with collectionBehavior —
@@ -957,7 +966,7 @@ fn run_desktop() {
                 if let Err(e) = position_capsule_bottom_center(&capsule, false) {
                     log::warn!("[capsule] position failed: {e}");
                 }
-                let _ = capsule.hide();
+                crate::webview_visibility::hide_window_with_webview(&capsule);
             }
 
             // QA / Less Computer windows are lazily created (not eagerly declared in
@@ -1014,6 +1023,7 @@ fn run_desktop() {
                     if let Err(e) = main.show() {
                         log::warn!("[main] initial show failed: {e}");
                     }
+                    crate::webview_visibility::sync_webview_visibility(&main, true);
                 }
             }
 
@@ -1023,6 +1033,14 @@ fn run_desktop() {
                     show_main_window(app.handle());
                 }
             }
+
+            // Windows declared `visible: false` in tauri.conf.json are created with
+            // the WebView2 controller still reporting itself visible, because Tauri
+            // passes `visible` to the window layer only. Without this pass every
+            // window that starts hidden keeps a renderer resident until it happens
+            // to be hidden through the code path that syncs the flag.
+            #[cfg(target_os = "windows")]
+            webview_visibility::sync_hidden_windows(app.handle());
 
             // Accessibility permission is no longer requested inside setup().
             //
@@ -2109,7 +2127,7 @@ pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     #[cfg(mobile)]
     let main = app.get_webview_window("main");
     if let Some(w) = main {
-        let _ = w.show();
+        crate::webview_visibility::show_window_with_webview(&w);
         #[cfg(not(mobile))]
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -2208,7 +2226,7 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.hide();
+        crate::webview_visibility::hide_window_with_webview(&w);
     }
     activate_menu_bar_mode(app);
 }
@@ -3048,6 +3066,11 @@ pub(crate) fn show_qa_window<R: tauri::Runtime>(app: &AppHandle<R>, content_kind
             log::warn!("[qa] show fallback failed: {e}");
         }
     }
+    // The no-activate path shows the HWND without going through Tauri, so the
+    // webview is re-enabled explicitly; showing an already-visible panel is the
+    // case where this must repair a stale hidden flag.
+    #[cfg(target_os = "windows")]
+    crate::webview_visibility::sync_webview_visibility(&window, true);
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     if let Err(e) = window.show() {
         log::warn!("[qa] show failed: {e}");
@@ -3313,7 +3336,7 @@ fn hide_chat_window_animated<R: tauri::Runtime>(
         return;
     };
     if !window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+        crate::webview_visibility::hide_window_with_webview(&window);
         return;
     }
     let token = epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3321,7 +3344,7 @@ fn hide_chat_window_animated<R: tauri::Runtime>(
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(240)).await;
         if epoch.load(Ordering::SeqCst) == token {
-            let _ = window.hide();
+            crate::webview_visibility::hide_window_with_webview(&window);
         }
     });
 }
@@ -3480,7 +3503,7 @@ pub(crate) fn hide_voice_edit_window<R: tauri::Runtime>(app: &AppHandle<R>) {
         return;
     }
     if let Some(window) = app.get_webview_window("voice-edit") {
-        let _ = window.hide();
+        crate::webview_visibility::hide_window_with_webview(&window);
     }
 }
 
@@ -3520,6 +3543,7 @@ pub(crate) fn show_selection_voice_intent_prompt<R: tauri::Runtime>(app: &AppHan
         log::warn!("[selection-voice] show intent prompt failed: {error}");
         return;
     }
+    crate::webview_visibility::sync_webview_visibility(&window, true);
     if let Err(error) = window.set_focus() {
         log::warn!("[selection-voice] focus intent prompt failed: {error}");
     }
@@ -3532,7 +3556,7 @@ pub(crate) fn show_selection_voice_intent_prompt<R: tauri::Runtime>(_app: &AppHa
 #[cfg(all(not(mobile), target_os = "windows"))]
 pub(crate) fn hide_selection_voice_intent_prompt<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("selection-voice-intent") {
-        let _ = window.hide();
+        crate::webview_visibility::hide_window_with_webview(&window);
     }
 }
 
@@ -3669,6 +3693,7 @@ pub(crate) fn show_less_computer_window<R: tauri::Runtime>(
                     log::warn!("[less-computer] show failed: {error}");
                     format!("Less Computer window show failed: {error}")
                 })
+                .map(|()| crate::webview_visibility::sync_webview_visibility(&window, true))
             });
         if result.is_ok() {
             LESS_COMPUTER_PANEL_EPOCH.fetch_add(1, Ordering::SeqCst);
@@ -3712,7 +3737,7 @@ pub(crate) fn hide_less_computer_glow<R: tauri::Runtime>(app: &AppHandle<R>) {
         // otherwise the webview keeps compositing the glow layer after .hide()
         // (Windows especially never releases the animations).
         let _ = window.emit("less-computer-glow:active", false);
-        let _ = window.hide();
+        crate::webview_visibility::hide_window_with_webview(&window);
     }
 }
 
@@ -3755,6 +3780,7 @@ fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R
     if window.show().is_err() {
         return false;
     }
+    crate::webview_visibility::sync_webview_visibility(&window, true);
     let _ = window.set_focus();
     true
 }

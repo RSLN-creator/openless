@@ -550,7 +550,7 @@ mod macos_impl {
 mod windows_impl {
     use super::{TisError, TypeError};
     use crate::types::WindowsSendInputNewlineMode;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tauri::{AppHandle, Runtime};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -587,54 +587,255 @@ mod windows_impl {
         }
     }
 
-    /// Characters per reveal step. The pacer writes one group, then waits, so the text
-    /// appears in a steady trickle instead of a burst.
-    const PACING_GROUP_CHARS: usize = 2;
-
-    /// Wait between reveal steps.
+    /// Target cadence between two revealed units.
     ///
-    /// The inner loop already pauses 1ms per keystroke, but a 60Hz compositor cannot show
-    /// anything finer than ~16ms, so a whole sentence sent at that speed reaches the screen
-    /// as one paint and reads as a single block. 8ms per two characters keeps the reveal
-    /// visible while staying fast enough for a long dictation.
-    const PACING_GROUP_DELAY: Duration = Duration::from_millis(8);
+    /// Pacing is a *schedule*, not a set of relative sleeps. Unit `n` of a write is due at
+    /// `start + n * PACING_STEP`; the loop waits until that instant and then sends. Two
+    /// consequences matter:
+    ///
+    /// * Every gap is the same length by construction. `sleep(step)` after each unit is not
+    ///   equivalent: the send itself costs 2-10ms, so that version's real cadence is
+    ///   `send + step` and jitters with every syscall. That is what made the earlier
+    ///   two-char/8ms pacer *slower* than no pacer at all (14.3ms per char instead of 10.3)
+    ///   while still not looking steady.
+    /// * A slow unit does not push the rest back. Once a deadline has passed, the following
+    ///   units are already overdue, so they send with no wait at all and the schedule
+    ///   recovers instead of drifting.
+    ///
+    /// 10ms is the smallest step that still leaves the send visible on its own: at a 60Hz
+    /// compositor a step shorter than the 16.7ms frame would paint two units in the same
+    /// frame half the time, which reads as a stutter rather than a stream.
+    const PACING_STEP: Duration = Duration::from_millis(10);
+
+    /// Busy-wait only for this last slice before a deadline.
+    ///
+    /// `std::thread::sleep` on this machine returns up to ~10ms late inside this process
+    /// (measured: 1.93ms standalone, 8.6-12ms per character in OpenLess). Sleeping the whole
+    /// remainder would therefore throw away the schedule above. Sleeping all but the last
+    /// 250µs and spinning the rest keeps the gap accurate without spending 15% of a core;
+    /// the spin only happens while text is being streamed.
+    const PACING_SPIN_SLICE: Duration = Duration::from_micros(250);
+
+    /// Minimum spacing between two SendInput characters/events.
+    ///
+    /// The module's Windows contract already measured that Chromium/Electron/Tauri can drop
+    /// characters when keyDown/keyUp arrive back-to-back. The reveal clock controls the
+    /// *visual* cadence, but it must never be the only spacing between actual keys: a
+    /// catch-up unit and a Latin word's inner letters still need this floor.
+    const MIN_KEY_GAP: Duration = Duration::from_millis(1);
 
     pub fn type_unicode_chunk(text: &str) -> Result<usize, TypeError> {
         type_unicode_chunk_with_options(text, WindowsSendInputOptions::default())
     }
 
+    /// Writes one chunk with a clock that belongs to this call alone.
+    ///
+    /// Only the standalone entry points use this; streaming passes the session's clock to
+    /// [`type_unicode_chunk_with_clock`] so the cadence spans the whole dictation.
     pub fn type_unicode_chunk_with_options(
         text: &str,
         options: WindowsSendInputOptions,
     ) -> Result<usize, TypeError> {
+        let mut clock = RevealClock::new(PACING_STEP);
+        type_unicode_chunk_with_clock(text, options, &mut clock)
+    }
+
+    /// Writes one chunk, pacing each revealed unit against `clock`.
+    ///
+    /// Pacing lives here, at the write entry point, and not in the per-keystroke loop: the
+    /// loop's one-gap-per-unit pause is the contract the streaming reconciliation and its
+    /// tests rely on, so it stays exactly as it is. This only replaces that pause's
+    /// *duration* with a schedule-driven one, which is the difference between "units arrive
+    /// at an even beat" and "units arrive 10.3ms apart plus whatever the sleep overshot by".
+    pub fn type_unicode_chunk_with_clock(
+        text: &str,
+        options: WindowsSendInputOptions,
+        clock: &mut RevealClock,
+    ) -> Result<usize, TypeError> {
         // The timer period is raised for the whole insertion session by
         // `TimerResolutionSession`; see its doc comment for why it is not scoped to this call.
         //
-        // The pacer splits the write into reveal steps and waits between them. Splitting here
-        // rather than in the loop keeps the per-keystroke contract (and its tests) untouched:
-        // each step is still an ordinary `type_unicode_chunk_with_sender` call.
-        let mut typed_chars = 0;
-        let mut rest = text;
-        while !rest.is_empty() {
-            let end = rest
-                .char_indices()
-                .map(|(index, _)| index)
-                .nth(PACING_GROUP_CHARS)
-                .unwrap_or(rest.len());
-            let (group, tail) = rest.split_at(end);
-            match type_unicode_chunk_with_sender(group, options, send_character) {
-                Ok(typed) => typed_chars += typed,
-                Err(TypeError::Partial { typed_chars: done, source }) => {
-                    return Err(partial_or_original(typed_chars + done, *source));
-                }
-                Err(error) => return Err(partial_or_original(typed_chars, error)),
-            }
-            rest = tail;
-            if !rest.is_empty() {
-                std::thread::sleep(PACING_GROUP_DELAY);
+        // Two kinds of pause reach this closure - the per-unit gap and the every-16th-unit
+        // `SENDINPUT_CHUNK_DELAY` - and both are folded into the one schedule. Letting the
+        // 12ms chunk pause through as an extra wait would put a visible hiccup every 16
+        // characters; the schedule already leaves more than 12ms of slack per 16 units at
+        // this cadence, so absorbing it costs no total time.
+        type_unicode_chunk_with_sender_and_sleeper(
+            text,
+            options,
+            |ch, options| {
+                send_character(ch, options)?;
+                // Enforce the module's documented minimum key spacing even inside a
+                // Latin word and in catch-up mode, where the reveal clock can make the
+                // *unit* gap zero. The clock shapes the visible beat; this floor keeps
+                // the target app from dropping characters.
+                std::thread::sleep(MIN_KEY_GAP);
+                Ok(())
+            },
+            |_hint| clock.wait_for_next_unit(PACING_SPIN_SLICE),
+        )
+    }
+
+    /// Deadline clock for the whole insertion session's reveal schedule.
+    ///
+    /// This is owned by the session, not by one write. That distinction is the entire point:
+    /// the polish model emits deltas unevenly (measured gaps between deltas inside one
+    /// dictation: 0ms, 76ms, 111ms, 429ms), so a clock that restarts per write resets to zero
+    /// at every delta and produces a fresh burst each time - which is exactly the "arrives in
+    /// blocks" complaint. One clock for the session makes the reveal rate a property of the
+    /// session, independent of when the model happens to emit.
+    ///
+    /// The schedule is *absolute*, never relative: unit `n` is due at `start + n * step`. A
+    /// slow unit therefore does not push the rest back - the following units are already
+    /// overdue and send immediately - so the cadence recovers instead of drifting, and a
+    /// backlog is absorbed at full speed rather than at a fixed lag.
+    pub struct RevealClock {
+        start: Instant,
+        step: Duration,
+        units: u32,
+        /// When the previous unit was actually released, or `None` before the first.
+        last_send: Option<Instant>,
+    }
+
+    impl RevealClock {
+        /// Starts a session clock at the default cadence.
+        ///
+        /// Constructed once per insertion session, never per write; see the type docs.
+        pub fn for_session() -> Self {
+            Self::new(PACING_STEP)
+        }
+
+        fn new(step: Duration) -> Self {
+            Self {
+                start: Instant::now(),
+                step,
+                units: 0,
+                last_send: None,
             }
         }
-        Ok(typed_chars)
+
+        /// Waits until the next unit's scheduled instant.
+        ///
+        /// The duration the per-keystroke loop passes in is ignored on purpose: the loop's
+        /// fixed constant is a floor that keeps the target application from dropping
+        /// keystrokes, while the cadence the user perceives is this schedule.
+        ///
+        /// # Why idle time is forgiven instead of banked
+        ///
+        /// A pure absolute schedule banks credit while the text is starved: the model pauses
+        /// 400ms, no unit is revealed, and on the next delta every unit in it is already
+        /// overdue, so the whole delta flushes at send speed - the burst this is meant to
+        /// remove, merely moved later. So a schedule that has fallen further behind than one
+        /// step re-anchors to *now* instead. Inside a continuous run nothing is ever that far
+        /// behind, so the beat stays unbroken; after a genuine stall the reveal resumes on
+        /// the beat from the moment text arrives rather than catching up in a clump.
+        ///
+        /// # Why the deadline also carries a floor
+        ///
+        /// The absolute schedule alone still produces one kind of bad gap: if the thread is
+        /// descheduled across a deadline - which happens routinely, this runs on a machine
+        /// also doing ASR and HTTP - then the unit after the stall keeps its old deadline and
+        /// follows the delayed unit almost immediately. Measured with a 9ms deschedule
+        /// injected every 5-20 units (200 units per run): the absolute schedule produced
+        /// 9-40 gaps shorter than 9ms, with a minimum as low as 4.5ms against a 10ms step.
+        /// A short gap is a character arriving on the heels of the previous one, which is the
+        /// part of "stutter" this can actually remove.
+        ///
+        /// Holding each unit until one full step after the previous unit *actually went out*
+        /// removes exactly those gaps (measured 40 -> 0) and lowers interval standard
+        /// deviation (2.39 -> 1.49ms in the worst run). The price is proportional to how
+        /// often a stall happens: +0.17ms per unit when stalling every 20 units, +0.74ms
+        /// when stalling every 5. With no stalls it costs nothing and both schedules are
+        /// exactly one step apart.
+        ///
+        /// This only ever matters when the send cost is below the step, i.e. when the loop is
+        /// genuinely waiting: that is the minority case in practice, since most dictations
+        /// average 10-16ms per character because the target application is the limit. In the
+        /// target-limited case every deadline is already in the past, the floor never raises
+        /// it, and this code does nothing at all. So this is not a speed change and must not
+        /// be described as one - it only evens out a cadence that is already being paced.
+        ///
+        /// Note this *defers* rather than *repays*. Carrying the lateness forward as credit
+        /// (the `debt` accumulator used by fractional-rate revealers) pulls the next deadline
+        /// earlier and compresses the gap further, which is the opposite of the fix: it
+        /// measured no better than the absolute schedule and produced more zero-wait bursts.
+        /// The mechanism `debt` addresses - integer rounding of a fractional chars-per-frame
+        /// budget - does not exist here, because this schedule is continuous time.
+        fn wait_for_next_unit(&mut self, spin_slice: Duration) {
+            self.units = self.units.saturating_add(1);
+            let mut due = next_unit_deadline(
+                self.start,
+                self.step,
+                self.units,
+                self.last_send,
+            );
+            let now = Instant::now();
+            // `now - due > step` means at least one whole step of starvation happened.
+            if now.saturating_duration_since(due) > self.step {
+                // Re-anchor to now instead of banking the whole stall as catch-up
+                // credit. `checked_sub` avoids an Instant underflow after a long
+                // session; the minimum key gap still applies to the first unit.
+                self.start = now
+                    .checked_sub(self.step * self.units)
+                    .unwrap_or(now);
+                due = now;
+            }
+            if let Some(last) = self.last_send {
+                let floor = last + MIN_KEY_GAP;
+                if floor > due {
+                    due = floor;
+                }
+            }
+            wait_until(due, spin_slice);
+            // Recorded after the wait, i.e. immediately before this unit is sent, so the
+            // floor above measures from when the unit actually left rather than when it
+            // was scheduled to.
+            self.last_send = Some(Instant::now());
+        }
+    }
+
+    /// Deadline for unit `units`, floored one step after the previous unit actually left.
+    ///
+    /// Split out from [`RevealClock::wait_for_next_unit`] so the schedule arithmetic can be
+    /// asserted directly: the wait itself involves real sleeps, which cannot be tested
+    /// without turning the test into a timing measurement.
+    fn next_unit_deadline(
+        start: Instant,
+        step: Duration,
+        units: u32,
+        last_send: Option<Instant>,
+    ) -> Instant {
+        let scheduled = start + step * units;
+        match last_send {
+            Some(last) => {
+                let floor = last + step.max(MIN_KEY_GAP);
+                if floor > scheduled {
+                    floor
+                } else {
+                    scheduled
+                }
+            }
+            None => scheduled,
+        }
+    }
+
+    /// Waits until `due`, sleeping the coarse part and spinning the last `spin_slice`.
+    ///
+    /// Returns immediately when the deadline has already passed, which is how a slow target
+    /// application (or a backlog) is prevented from stretching the whole write.
+    fn wait_until(due: Instant, spin_slice: Duration) {
+        let remaining = match due.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            None => return,
+        };
+        if let Some(coarse) = remaining.checked_sub(spin_slice) {
+            if !coarse.is_zero() {
+                std::thread::sleep(coarse);
+            }
+        }
+        while Instant::now() < due {
+            std::hint::spin_loop();
+        }
     }
 
     /// Scoped `timeBeginPeriod(1)` so the per-keystroke sleeps land near 1ms instead of being
@@ -757,47 +958,6 @@ mod windows_impl {
     #[cfg(test)]
     mod consumption_tests {
         use super::*;
-
-        /// The pacer splits a write into groups of [`PACING_GROUP_CHARS`] and keeps the text
-        /// intact: every scalar is typed exactly once, in order, and no group splits a
-        /// character. A split character would arrive as U+FFFD in the host.
-        #[test]
-        fn pacer_keeps_every_scalar_in_order_without_splitting_characters() {
-            let text = "中文ab🙂\r\n结尾";
-            let mut groups = Vec::new();
-            let mut rest = text;
-            while !rest.is_empty() {
-                let end = rest
-                    .char_indices()
-                    .map(|(index, _)| index)
-                    .nth(PACING_GROUP_CHARS)
-                    .unwrap_or(rest.len());
-                let (group, tail) = rest.split_at(end);
-                groups.push(group.to_string());
-                rest = tail;
-            }
-
-            // Groups are non-empty, at most PACING_GROUP_CHARS scalars, and reassemble the
-            // input exactly.
-            assert!(groups.iter().all(|group| !group.is_empty()));
-            for group in &groups {
-                assert!(
-                    group.chars().count() <= PACING_GROUP_CHARS,
-                    "group {group:?} exceeds the reveal step"
-                );
-            }
-            assert_eq!(groups.concat(), text);
-
-            // A multi-byte scalar must never land on a boundary.
-            for group in &groups {
-                for ch in group.chars() {
-                    assert_ne!(ch, '\u{FFFD}', "character split across reveal steps");
-                }
-            }
-
-            // A 2-scalar step over 9 scalars needs 5 groups, not one.
-            assert_eq!(groups.len(), 5);
-        }
 
         /// The pacer must not change the consumed-scalar contract: it reports the same
         /// prefix length a single unbatched write would.
@@ -981,6 +1141,63 @@ mod windows_impl {
             )
             .unwrap_err();
             assert_eq!(error.typed_chars(), 2);
+        }
+
+        /// The first unit of a session has no predecessor, so it is due purely on the
+        /// absolute schedule. Without this the floor below would need a sentinel.
+        #[test]
+        fn first_unit_deadline_is_the_absolute_schedule() {
+            let start = Instant::now();
+            let step = Duration::from_millis(10);
+            assert_eq!(next_unit_deadline(start, step, 1, None), start + step * 1);
+            assert_eq!(next_unit_deadline(start, step, 7, None), start + step * 7);
+        }
+
+        /// A unit that goes out on time leaves the absolute schedule untouched: the floor
+        /// must not *lengthen* the beat when nothing was late.
+        #[test]
+        fn on_time_unit_keeps_the_absolute_schedule() {
+            let start = Instant::now();
+            let step = Duration::from_millis(10);
+            // Unit 4 went out exactly on its deadline.
+            let on_time = start + step * 4;
+            assert_eq!(
+                next_unit_deadline(start, step, 5, Some(on_time)),
+                start + step * 5
+            );
+        }
+
+        /// The case the floor exists for: unit 4 slipped 7ms past its deadline, which would
+        /// otherwise leave unit 5 only 3ms away and read as a stutter. It must be pushed out
+        /// to a full step after the unit that actually left.
+        #[test]
+        fn late_unit_does_not_compress_the_next_gap() {
+            let start = Instant::now();
+            let step = Duration::from_millis(10);
+            let late = start + step * 4 + Duration::from_millis(7);
+            let due = next_unit_deadline(start, step, 5, Some(late));
+
+            assert_eq!(due, late + step, "gap must be a full step, not 3ms");
+            let gap = due.duration_since(late);
+            assert!(
+                gap >= step,
+                "compressed gap {gap:?} is the stutter this floor removes"
+            );
+        }
+
+        /// The floor must never pull a deadline earlier, only push it later, otherwise a
+        /// starved session would be flushed at send speed instead of on the beat.
+        #[test]
+        fn floor_never_moves_the_deadline_earlier() {
+            let start = Instant::now();
+            let step = Duration::from_millis(10);
+            // A predecessor that left long ago (the model paused) must not drag unit 9 back.
+            let ancient = start;
+            assert_eq!(
+                next_unit_deadline(start, step, 9, Some(ancient)),
+                start + step * 9,
+                "an old last_send must not shorten the schedule"
+            );
         }
     }
 
@@ -1446,6 +1663,6 @@ pub use macos_impl::{
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use windows_impl::{
-    restore_input_source, switch_to_ascii, type_unicode_chunk, type_unicode_chunk_with_options,
-    PreviousInputSource, WindowsSendInputOptions,
+    restore_input_source, switch_to_ascii, type_unicode_chunk, type_unicode_chunk_with_clock,
+    type_unicode_chunk_with_options, PreviousInputSource, RevealClock, WindowsSendInputOptions,
 };

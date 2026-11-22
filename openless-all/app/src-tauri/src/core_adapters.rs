@@ -4226,6 +4226,13 @@ where
     result
 }
 
+#[cfg(target_os = "windows")]
+fn uses_sendinput_keystrokes(context: &DictationContext) -> bool {
+    !context.insertion.composition_input
+        && context.insertion.windows_insertion_mode
+            == openless_core::shared_types::WindowsInsertionMode::SendInput
+}
+
 impl CoreTextInserter for TauriTextInserter {
     fn capture_target(&self) -> Option<CapturedTextTarget> {
         let insertion_target = crate::selection::capture_selection_insertion_target();
@@ -4334,7 +4341,7 @@ impl CoreTextInserter for TauriTextInserter {
             };
             #[cfg(not(target_os = "macos"))]
             let _ = app;
-            #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
             let live_composition =
                 if context.insertion.composition_input && context.insertion.enabled {
                     let capture = live_capture.and_then(|capture| capture.lock().take());
@@ -4345,12 +4352,45 @@ impl CoreTextInserter for TauriTextInserter {
                 } else {
                     None
                 };
+            #[cfg(target_os = "windows")]
+            let insertion_point_available = {
+                let target = insertion_target.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::host_document::has_insertion_point_for_target(&target)
+                })
+                .await
+                .ok()
+                .flatten()
+            };
+            #[cfg(target_os = "windows")]
+            if insertion_point_available == Some(false) {
+                log::info!(
+                    "[core-adapter] captured foreground control has no text insertion point; dictation will use the result card"
+                );
+            }
+            // Only a SendInput session sleeps between characters, so only it benefits from a
+            // finer timer tick. TSF composition and clipboard delivery never see the 1ms gap.
+            #[cfg(target_os = "windows")]
+            let timer_resolution = if uses_sendinput_keystrokes(&context) {
+                crate::unicode_keystroke::TimerResolutionSession::raise()
+            } else {
+                crate::unicode_keystroke::TimerResolutionSession::raise_noop()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let timer_resolution = crate::unicode_keystroke::TimerResolutionSession::raise_noop();
             let session = Arc::new(TauriTextInsertionSession {
                 session_id,
                 backend,
                 context,
                 insertion_target,
+                #[cfg(target_os = "windows")]
+                insertion_point_available,
                 finished: Arc::new(AtomicBool::new(false)),
+                timer_resolution: Arc::new(timer_resolution),
+                #[cfg(target_os = "windows")]
+                reveal_clock: Arc::new(Mutex::new(
+                    crate::unicode_keystroke::RevealClock::for_session(),
+                )),
                 #[cfg(target_os = "windows")]
                 windows_ime,
                 #[cfg(target_os = "windows")]
@@ -4408,7 +4448,21 @@ struct TauriTextInsertionSession {
     backend: BackendSlot,
     context: Arc<DictationContext>,
     insertion_target: crate::selection::SelectionInsertionTarget,
+    /// `Some(false)` is positive evidence that the focused control cannot
+    /// accept text. `None` is only an unknown UIA capability and must not be
+    /// presented to the user as "no caret".
+    #[cfg(target_os = "windows")]
+    insertion_point_available: Option<bool>,
     finished: Arc<AtomicBool>,
+    /// Raised Windows timer period for the length of this session, so the per-character
+    /// streaming gap is not quantized to the default system tick. Shared by `Arc` so cloning
+    /// the session does not request the period twice; dropping the last handle restores it.
+    timer_resolution: Arc<crate::unicode_keystroke::TimerResolutionSession>,
+    /// Reveal cadence for this whole dictation. Session-scoped so the beat survives the
+    /// uneven delta arrival the polish model produces; see `RevealClock` for why a
+    /// per-write clock turns every delta into a fresh burst.
+    #[cfg(target_os = "windows")]
+    reveal_clock: Arc<Mutex<crate::unicode_keystroke::RevealClock>>,
     #[cfg(target_os = "windows")]
     windows_ime: Arc<crate::windows_ime_session::WindowsImeSessionController>,
     #[cfg(target_os = "windows")]
@@ -4776,6 +4830,14 @@ impl TauriTextInsertionSession {
     }
 
     fn restore_insertion_target(&self) -> Result<(), BackendError> {
+        #[cfg(target_os = "windows")]
+        if self.insertion_point_available == Some(false) {
+            return Err(BackendError::new(
+                BackendErrorCode::Platform,
+                "the captured foreground control has no text insertion point",
+            )
+            .target_unavailable());
+        }
         crate::selection::reactivate_selection_insertion_target(&self.insertion_target)
             .then_some(())
             .ok_or_else(|| {
@@ -4805,7 +4867,7 @@ impl TauriTextInsertionSession {
             })?;
             worker.write(text).await
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         self.restore_insertion_target()?;
         #[cfg(target_os = "windows")]
         {
@@ -4818,31 +4880,46 @@ impl TauriTextInsertionSession {
                 ));
             }
             let chunk = text.clone();
-            #[cfg(target_os = "windows")]
             let newline_mode = self.context.insertion.windows_sendinput_newline_mode;
-            let finished = Arc::clone(&self.finished);
-            let written = tauri::async_runtime::spawn_blocking(move || {
-                if finished.load(Ordering::Acquire) {
-                    return 0;
-                }
-                #[cfg(target_os = "windows")]
-                let result = crate::unicode_keystroke::type_unicode_chunk_with_options(
-                    &chunk,
-                    crate::unicode_keystroke::WindowsSendInputOptions { newline_mode },
-                );
-                let written = match result {
-                    Ok(written) => written,
-                    Err(error) => error.typed_chars(),
-                };
-                written
-            })
-            .await
-            .map_err(|error| {
-                BackendError::new(
-                    BackendErrorCode::Internal,
-                    format!("join Tauri streaming insertion task: {error}"),
-                )
-            })?;
+let session = self.clone();
+            let written =
+                tauri::async_runtime::spawn_blocking(move || -> Result<usize, BackendError> {
+                    if session.finished.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    // Revalidate on the same blocking thread, immediately before
+                    // SendInput. The async handoff must not become a window in
+                    // which keystrokes can land in a newly focused application.
+                    session.restore_insertion_target()?;
+                    let started = std::time::Instant::now();
+                    let result = {
+                        // parking_lot's guard has no poisoning, so the clock cannot be left
+                        // half-advanced by a panicking writer.
+                        let mut clock = session.reveal_clock.lock();
+                        crate::unicode_keystroke::type_unicode_chunk_with_clock(
+                            &chunk,
+                            crate::unicode_keystroke::WindowsSendInputOptions { newline_mode },
+                            &mut clock,
+                        )
+                    };
+                    let written = match result {
+                        Ok(written) => written,
+                        Err(error) => error.typed_chars(),
+                    };
+                    log::info!(
+                        "[insert-timing] sendinput chunks={} chars={written} elapsed_ms={}",
+                        chunk.chars().count(),
+                        started.elapsed().as_millis()
+                    );
+                    Ok(written)
+                })
+                .await
+                .map_err(|error| {
+                    BackendError::new(
+                        BackendErrorCode::Internal,
+                        format!("join Tauri streaming insertion task: {error}"),
+                    )
+                })??;
             Ok(InsertWriteResult {
                 written_chars: written,
             })

@@ -19,6 +19,7 @@ use capsule_hit_test::{
 
 #[path = "capsule_snapshot.rs"]
 mod capsule_snapshot;
+
 use capsule_snapshot::CapsuleSnapshotState;
 use openless_core::BackendEvent;
 use parking_lot::Mutex;
@@ -129,7 +130,7 @@ fn position_rail_for_capsule<R: tauri::Runtime>(
     let rail_visible_before = rail.is_visible().unwrap_or(false);
     let Some(position) = capsule_transcript_rail_position(style, translation_active, visible)
     else {
-        rail.hide()?;
+        crate::webview_visibility::hide_window_with_webview(&rail);
         return Ok(());
     };
     rail.set_ignore_cursor_events(true)?;
@@ -403,9 +404,12 @@ pub(crate) fn show_capsule_window_for_recording<R: tauri::Runtime>(
     }
 
     if needs_fallback {
-        if let Err(error) = window.show() {
-            log::warn!("[capsule] show fallback failed: {error}");
-        }
+        crate::webview_visibility::show_window_with_webview(window);
+    } else {
+        // The Win32 no-activate path shows the parent HWND without going
+        // through Tauri, so the webview flag has to be re-enabled explicitly or
+        // the capsule would render into an invisible webview.
+        crate::webview_visibility::sync_webview_visibility(window, true);
     }
 }
 
@@ -568,6 +572,7 @@ fn hide_capsule_mirror<R: tauri::Runtime>(
     };
 
     window.hide().map_err(|_| "tauri_hide_failed")?;
+    crate::webview_visibility::sync_webview_visibility(window, false);
     let handle = window
         .window_handle()
         .map_err(|_| "win32_handle_unavailable")?;
@@ -599,7 +604,8 @@ fn hide_capsule_mirror<R: tauri::Runtime>(
 fn hide_capsule_mirror<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
 ) -> Result<(), &'static str> {
-    window.hide().map_err(|_| "tauri_hide_failed")
+    crate::webview_visibility::hide_window_with_webview(window);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -771,7 +777,14 @@ struct CapsuleWindowState {
     foreground_session_id: Mutex<Option<String>>,
     foreground_target_captured: AtomicBool,
     fallback_card_visible: AtomicBool,
+    /// Whether the result card has already been revealed at its measured size.
+    /// The window stays hidden between `begin_fallback_card` and this flag so
+    /// the placeholder height is never composited.
+    fallback_card_shown: AtomicBool,
     fallback_presentation_id: AtomicU64,
+    /// Monitor that owned the card before it was parked off-screen; moving the
+    /// window to -30000 makes `current_monitor()` lose the user's screen.
+    fallback_card_monitor: Mutex<Option<tauri::Monitor>>,
     fallback_payload: Mutex<Option<crate::types::InsertFallbackCardPayload>>,
     deferred_payload: Mutex<Option<CapsulePayload>>,
     snapshot: Mutex<CapsuleSnapshotState>,
@@ -799,7 +812,9 @@ impl Default for CapsuleWindowState {
             foreground_session_id: Mutex::new(None),
             foreground_target_captured: AtomicBool::new(false),
             fallback_card_visible: AtomicBool::new(false),
+            fallback_card_shown: AtomicBool::new(false),
             fallback_presentation_id: AtomicU64::new(0),
+            fallback_card_monitor: Mutex::new(None),
             fallback_payload: Mutex::new(None),
             deferred_payload: Mutex::new(None),
             snapshot: Mutex::new(CapsuleSnapshotState::default()),
@@ -915,6 +930,7 @@ impl CapsuleWindowState {
     fn begin_fallback_card(&self) -> u64 {
         self.deferred_payload.lock().take();
         self.fallback_card_visible.store(true, Ordering::SeqCst);
+        self.fallback_card_shown.store(false, Ordering::SeqCst);
         self.fallback_presentation_id
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
@@ -922,10 +938,23 @@ impl CapsuleWindowState {
 
     fn dismiss_fallback_card(&self) -> (bool, Option<CapsulePayload>) {
         let was_visible = self.fallback_card_visible.swap(false, Ordering::SeqCst);
+        self.fallback_card_shown.store(false, Ordering::SeqCst);
         let deferred = was_visible
             .then(|| self.deferred_payload.lock().take())
             .flatten();
         (was_visible, deferred)
+    }
+
+    /// Whether the active card already left its off-screen staging area.
+    fn fallback_card_already_revealed(&self) -> bool {
+        self.fallback_card_shown.load(Ordering::SeqCst)
+    }
+
+    /// Claims the one allowed reveal for the active card. A later height report
+    /// still resizes the visible card, but cannot show it a second time.
+    fn mark_fallback_card_shown(&self) -> bool {
+        self.fallback_card_visible.load(Ordering::SeqCst)
+            && !self.fallback_card_shown.swap(true, Ordering::SeqCst)
     }
 
     fn defer_if_fallback_active(&self, payload: &CapsulePayload) -> bool {
@@ -964,6 +993,83 @@ pub(crate) struct TauriCapsuleWindow {
 impl TauriCapsuleWindow {
     fn window(&self) -> Option<tauri::WebviewWindow> {
         self.app.get_webview_window("capsule")
+    }
+
+    /// Parks the native capsule window outside the desktop and shows it there.
+    ///
+    /// A hidden WebView2 suspends painting, so measuring while hidden and
+    /// revealing afterwards produces a blank first frame. Keeping the window
+    /// _visible but off-screen_ lets Chromium lay out, resize and paint the
+    /// card; only a settled frame is then moved on-screen.
+    pub(crate) fn prepare_fallback_card_window(&self) {
+        self.stop_layout_watch();
+        self.hide_transcript_overlay();
+        let Some(window) = self.window() else {
+            return;
+        };
+        if let Ok(Some(monitor)) = window.current_monitor() {
+            *self.state.fallback_card_monitor.lock() = Some(monitor);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE,
+            };
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(raw) = handle.as_raw() {
+                    let _ = unsafe {
+                        SetWindowPos(
+                            HWND(raw.hwnd.get() as *mut _),
+                            HWND_TOPMOST,
+                            -30_000,
+                            -30_000,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        )
+                    };
+                }
+            }
+        }
+        // Off-screen visibility is also what makes WebView2 keep painting.
+        self.show_for_recording(true);
+        #[cfg(target_os = "windows")]
+        if let Some(window) = self.window() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                IsWindowVisible, ShowWindow, SW_SHOWNOACTIVATE,
+            };
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(raw) = handle.as_raw() {
+                    let hwnd = HWND(raw.hwnd.get() as *mut _);
+                    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+                        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether this presentation already had its one reveal.
+    ///
+    /// The reveal timeout uses this to avoid repositioning a card that the
+    /// measured-height path already placed: the timeout only knows the probe
+    /// height, so applying it late would shift a visible card.
+    pub(crate) fn fallback_card_already_revealed(&self) -> bool {
+        self.state.fallback_card_already_revealed()
+    }
+
+    /// Shows the result card once at the size the frontend measured.
+    /// Returns false when this presentation was already revealed (or is stale).
+    pub(crate) fn reveal_fallback_card(&self) -> bool {
+        if !self.state.mark_fallback_card_shown() {
+            return false;
+        }
+        self.show_for_recording(true);
+        true
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1045,7 +1151,7 @@ impl TauriCapsuleWindow {
 
     fn hide_transcript_overlay(&self) {
         if let Some(window) = self.rail_window() {
-            let _ = window.hide();
+            crate::webview_visibility::hide_window_with_webview(&window);
         }
     }
 
@@ -1057,8 +1163,20 @@ impl TauriCapsuleWindow {
         translation_active: bool,
         visible: bool,
     ) -> tauri::Result<()> {
-        let Some(rail) = self.rail_window() else {
+        // When the transcript is off the rail does not exist, and that is the
+        // intended state: `desktop_resources::configure` skips creating it. Asking
+        // for a window that was deliberately never built is not an error.
+        if !visible && !crate::desktop_resources::capsule_transcript_active() {
             return Ok(());
+        }
+        // The rail may also be missing because the preference was turned on after
+        // launch; build it here rather than silently dropping the transcript.
+        let rail = match self.rail_window() {
+            Some(rail) => rail,
+            None => match crate::desktop_resources::ensure_transcript_rail(&self.app)? {
+                Some(rail) => rail,
+                None => return Ok(()),
+            },
         };
         let scale = capsule.scale_factor().unwrap_or(1.0);
         let main_position = capsule.outer_position()?;
@@ -1389,7 +1507,8 @@ impl TauriCapsuleWindow {
                     let hide_result = if prefix == CAPSULE_MIRROR_PREFIX {
                         hide_capsule_mirror(&window).map_err(|error| error.to_string())
                     } else {
-                        window.hide().map_err(|error| error.to_string())
+                        crate::webview_visibility::hide_window_with_webview(&window);
+                        Ok(())
                     };
                     if let Err(error) = hide_result {
                         log::warn!("[capsule] mirror hide failed: {error}");
@@ -1699,8 +1818,12 @@ impl TauriCapsuleWindow {
         let Some(window) = self.window() else {
             return Ok(());
         };
-        let Some(monitor) = window.current_monitor()? else {
-            return Ok(());
+        let monitor = match self.state.fallback_card_monitor.lock().clone() {
+            Some(monitor) => monitor,
+            None => match window.current_monitor()? {
+                Some(monitor) => monitor,
+                None => return Ok(()),
+            },
         };
         let scale = monitor.scale_factor();
         let size = monitor.size();
@@ -2382,7 +2505,7 @@ impl TauriCoordinatorHost {
     }
 
     pub(crate) fn set_qa_voice_active(&self, active: bool) {
-        self.capsule.qa_voice_active.store(active, Ordering::SeqCst);
+self.capsule.qa_voice_active.store(active, Ordering::SeqCst);
     }
 
     pub(crate) fn cached_capsule_style(&self) -> CapsuleStyle {
@@ -2894,6 +3017,20 @@ mod tests {
             assert_eq!(expanded_y + expanded_height as i32, y + height as i32);
             assert!(expanded_height >= height);
         }
+    }
+
+    #[test]
+    fn fallback_card_reveals_once_and_resets_for_the_next_card() {
+        let state = CapsuleWindowState::default();
+        state.begin_fallback_card();
+        assert!(!state.fallback_card_already_revealed());
+        assert!(state.mark_fallback_card_shown());
+        assert!(state.fallback_card_already_revealed());
+        assert!(!state.mark_fallback_card_shown());
+        state.dismiss_fallback_card();
+        state.begin_fallback_card();
+        assert!(!state.fallback_card_already_revealed());
+        assert!(state.mark_fallback_card_shown());
     }
 
     #[test]

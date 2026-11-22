@@ -10,16 +10,80 @@ pub(crate) fn active() -> bool {
     LOW_MEMORY_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Whether the live-transcript rail is enabled. Fixed at launch, like the rest of
+/// the desktop window policy, so an in-flight session never changes topology.
+static CAPSULE_TRANSCRIPT_ACTIVE: AtomicBool = AtomicBool::new(true);
+
 #[cfg(not(mobile))]
-pub(crate) fn configure(context: &mut tauri::Context<tauri::Wry>, enabled: bool) {
-    LOW_MEMORY_ACTIVE.store(enabled, Ordering::Relaxed);
-    if enabled {
-        for window in &mut context.config_mut().app.windows {
-            if matches!(window.label.as_str(), "main" | "capsule" | "capsule-rail") {
-                window.create = false;
-            }
+pub(crate) fn configure(
+    context: &mut tauri::Context<tauri::Wry>,
+    low_memory: bool,
+    capsule_transcript: bool,
+) {
+    LOW_MEMORY_ACTIVE.store(low_memory, Ordering::Relaxed);
+    CAPSULE_TRANSCRIPT_ACTIVE.store(capsule_transcript, Ordering::Relaxed);
+    for window in &mut context.config_mut().app.windows {
+        if low_memory && matches!(window.label.as_str(), "main" | "capsule" | "capsule-rail") {
+            window.create = false;
+        }
+        // The transcript rail is a separate webview that costs a whole renderer
+        // process (~80 MB) whether or not it is ever shown. When the transcript
+        // preference is off it was still being created at launch and hidden
+        // immediately, because the flag is only consulted later, by the capsule UI
+        // at runtime. Skipping creation here is the difference between paying for a
+        // feature that is switched off and not paying for it.
+        //
+        // Windows only: tauri.windows.conf.json is what declares the rail, so other
+        // platforms have no such window to skip. `ensure_transcript_rail` creates it
+        // on demand if the preference is turned on later.
+        if !capsule_transcript && window.label == "capsule-rail" && cfg!(target_os = "windows") {
+            window.create = false;
         }
     }
+}
+
+/// Whether the transcript rail exists under the current policy.
+///
+/// Read by the capsule host before touching the rail so it can create it on demand
+/// instead of assuming the config declared it.
+#[cfg(not(mobile))]
+pub(crate) fn capsule_transcript_active() -> bool {
+    CAPSULE_TRANSCRIPT_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Creates the transcript rail if the preference asks for it and it is missing.
+///
+/// Returns the window, or `None` when the feature is off. Kept next to
+/// [`ensure_main`] and [`ensure_card_window`], which solve the same problem for the
+/// other two windows.
+#[cfg(all(not(mobile), target_os = "windows"))]
+pub(crate) fn ensure_transcript_rail<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> tauri::Result<Option<tauri::WebviewWindow<R>>> {
+    use tauri::Manager;
+    if !CAPSULE_TRANSCRIPT_ACTIVE.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    if let Some(window) = app.get_webview_window("capsule-rail") {
+        return Ok(Some(window));
+    }
+    let Some(config) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "capsule-rail")
+    else {
+        return Ok(None);
+    };
+    let window = tauri::WebviewWindowBuilder::from_config(app, config)?.build()?;
+    // Built visible by default would flash; the caller positions and shows it.
+    if let Err(error) = window.hide() {
+        log::warn!("[capsule] transcript rail hide after build failed: {error}");
+    }
+    crate::webview_visibility::sync_webview_visibility(&window, false);
+    log::info!("[capsule] transcript rail created on demand");
+    Ok(Some(window))
 }
 
 #[cfg(not(mobile))]
@@ -124,7 +188,7 @@ pub(crate) fn close_main<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     // Let the WebView unload its document before destroying the native window. WebKit can
     // otherwise keep the page's JS/DOM allocator in the shared content process used by the
     // resident capsule, which makes a closed main window look like a memory leak.
-    let _ = window.hide();
+    crate::webview_visibility::hide_window_with_webview(&window);
     let _ = window.eval("window.stop(); location.replace('about:blank');");
     let app_for_destroy = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -184,7 +248,7 @@ pub(crate) fn hide_main_with_grace<R: tauri::Runtime>(app: &tauri::AppHandle<R>)
     } else {
         0
     };
-    let _ = window.hide();
+    crate::webview_visibility::hide_window_with_webview(&window);
     let app_for_destroy = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(MAIN_CLOSE_GRACE).await;
@@ -256,6 +320,7 @@ pub(crate) fn hide_capsule_window<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
 ) -> tauri::Result<()> {
     window.hide()?;
+    crate::webview_visibility::sync_webview_visibility(window, false);
     if active() {
         window.destroy()?;
     }
