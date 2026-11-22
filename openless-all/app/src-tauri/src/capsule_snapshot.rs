@@ -1,8 +1,8 @@
 //! Replay state for the native transcript rail, independent of Tauri window handles.
 
 use openless_core::{
-    BackendEvent, BackendEventKind, CapsulePayload, CapsuleState, DictationPhase,
-    LessComputerEvent, LessComputerEventKind, SelectionVoicePhase,
+    BackendEvent, BackendEventKind, CapsulePayload, CapsuleState, DictationInsertStatus,
+    DictationPhase, LessComputerEvent, LessComputerEventKind, SelectionVoicePhase,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -28,6 +28,22 @@ fn can_commit_capsule_payload(
         && pending_revision.map_or(true, |pending| pending == current_revision)
 }
 
+/// A successful foreground insertion is already visible in the target editor;
+/// a second "已输入" capsule only keeps a stale overlay on screen. Clipboard
+/// fallback still needs terminal feedback alongside its full-text result card,
+/// and non-foreground tasks keep their ordinary completion notice.
+pub(crate) fn dictation_completed_capsule_state(inserted: &DictationInsertStatus) -> CapsuleState {
+    match inserted {
+        // Only a verified insertion is already visible in the target editor.
+        // `PasteSent` is explicitly unverified (the UI says "已发送粘贴，请确认"),
+        // so it must keep the Done capsule and its confirmation message.
+        DictationInsertStatus::Inserted => CapsuleState::Idle,
+        DictationInsertStatus::PasteSent
+        | DictationInsertStatus::CopiedFallback
+        | DictationInsertStatus::NotRequested => CapsuleState::Done,
+    }
+}
+
 fn payload_matches_backend_event(payload: &CapsulePayload, event: &BackendEventKind) -> bool {
     match event {
         BackendEventKind::DictationStateChanged(dictation) => {
@@ -42,7 +58,9 @@ fn payload_matches_backend_event(payload: &CapsulePayload, event: &BackendEventK
             };
             payload.state == expected
         }
-        BackendEventKind::DictationCompleted(_) => payload.state == CapsuleState::Done,
+        BackendEventKind::DictationCompleted(result) => {
+            payload.state == dictation_completed_capsule_state(&result.inserted)
+        }
         BackendEventKind::BackendStopping => payload.state == CapsuleState::Idle,
         BackendEventKind::SelectionVoiceLevel(_) => payload.state == CapsuleState::Recording,
         BackendEventKind::SelectionVoiceStateChanged(selection) => {
@@ -128,21 +146,26 @@ impl CapsuleSnapshotState {
             }) => event_session.clone(),
             _ => None,
         };
-        let payload_projection_pending = matches!(
-            &event.kind,
-            BackendEventKind::DictationStateChanged(_)
-                | BackendEventKind::TranscriptDelta(_)
-                | BackendEventKind::DictationCompleted(_)
-                | BackendEventKind::QaLevel(_)
-                | BackendEventKind::QaState(_)
-                | BackendEventKind::SelectionVoiceLevel(_)
-                | BackendEventKind::SelectionVoiceStateChanged(_)
-                | BackendEventKind::BackendStopping
-                | BackendEventKind::LessComputerEvent(LessComputerEvent {
-                    kind: LessComputerEventKind::VoiceState { .. },
-                    ..
-                })
-        );
+        let payload_projection_pending = match &event.kind {
+            // Completed is a terminal replay watermark, not a visual projection:
+            // `emit_dictation_state` returns before presenting it. Treating it as
+            // pending would leave the snapshot waiting for a frame that never comes.
+            BackendEventKind::DictationStateChanged(dictation) => {
+                dictation.phase != DictationPhase::Completed
+            }
+            BackendEventKind::TranscriptDelta(_)
+            | BackendEventKind::DictationCompleted(_)
+            | BackendEventKind::QaLevel(_)
+            | BackendEventKind::QaState(_)
+            | BackendEventKind::SelectionVoiceLevel(_)
+            | BackendEventKind::SelectionVoiceStateChanged(_)
+            | BackendEventKind::BackendStopping
+            | BackendEventKind::LessComputerEvent(LessComputerEvent {
+                kind: LessComputerEventKind::VoiceState { .. },
+                ..
+            }) => true,
+            _ => false,
+        };
         match &event.kind {
             BackendEventKind::DictationStateChanged(dictation)
                 if dictation.phase == DictationPhase::Starting =>
@@ -286,6 +309,75 @@ mod tests {
         }
         snapshot.text = "previous transcript".into();
         (snapshot, session_id)
+    }
+
+    #[test]
+    fn successful_insertion_completion_matches_the_idle_replay_frame() {
+        let session_id = SessionId::new();
+        for (inserted, state) in [
+            (
+                openless_core::DictationInsertStatus::Inserted,
+                CapsuleState::Idle,
+            ),
+            (
+                openless_core::DictationInsertStatus::PasteSent,
+                CapsuleState::Done,
+            ),
+            (
+                openless_core::DictationInsertStatus::CopiedFallback,
+                CapsuleState::Done,
+            ),
+            (
+                openless_core::DictationInsertStatus::NotRequested,
+                CapsuleState::Done,
+            ),
+        ] {
+            let event = BackendEventKind::DictationCompleted(openless_core::DictationResult {
+                session_id,
+                raw_text: "raw".into(),
+                polished_text: "final".into(),
+                polish_source: None,
+                duration_ms: 1,
+                inserted,
+            });
+            assert!(payload_matches_backend_event(
+                &payload(session_id, state),
+                &event
+            ));
+        }
+    }
+
+    #[test]
+    fn completed_state_event_does_not_wait_for_a_frame_it_never_projects() {
+        let session_id = SessionId::new();
+        let mut snapshot = CapsuleSnapshotState::default();
+        snapshot.record_backend_event(&BackendEvent {
+            sequence: 4,
+            session_id: Some(session_id),
+            kind: BackendEventKind::DictationCompleted(openless_core::DictationResult {
+                session_id,
+                raw_text: "raw".into(),
+                polished_text: "final".into(),
+                polish_source: None,
+                duration_ms: 1,
+                inserted: openless_core::DictationInsertStatus::Inserted,
+            }),
+        });
+        assert!(snapshot.commit_capsule_payload(&payload(session_id, CapsuleState::Idle), 4));
+
+        snapshot.record_backend_event(&BackendEvent {
+            sequence: 5,
+            session_id: Some(session_id),
+            kind: BackendEventKind::DictationStateChanged(DictationStateSnapshot {
+                phase: DictationPhase::Completed,
+                session_id: Some(session_id),
+                message: Some("inserted".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(snapshot.pending_payload_revision.is_none());
+        assert_eq!(snapshot.revision, 5);
+        assert_eq!(snapshot.payload_revision, 5);
     }
 
     #[test]

@@ -13,6 +13,8 @@ use openless_core::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::tauri_coordinator_host::dictation_completed_capsule_state;
+
 #[derive(Default)]
 struct CapsuleOwners {
     transcription_notice: Option<SessionId>,
@@ -231,7 +233,7 @@ async fn forward_legacy_event(
                 };
                 coordinator.present_core_capsule(CapsulePayload {
                     session_id: Some(result.session_id.to_string()),
-                    state: CapsuleState::Done,
+                    state: dictation_completed_capsule_state(&result.inserted),
                     level: 0.0,
                     elapsed_ms: result.duration_ms,
                     message: Some(message.to_string()),
@@ -903,6 +905,24 @@ fn resync_domain_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_foreground_insertion_does_not_leave_a_done_capsule() {
+        assert_eq!(
+            dictation_completed_capsule_state(&openless_core::DictationInsertStatus::Inserted),
+            CapsuleState::Idle
+        );
+        for inserted in [
+            openless_core::DictationInsertStatus::PasteSent,
+            openless_core::DictationInsertStatus::CopiedFallback,
+            openless_core::DictationInsertStatus::NotRequested,
+        ] {
+            assert_eq!(
+                dictation_completed_capsule_state(&inserted),
+                CapsuleState::Done
+            );
+        }
+    }
 
     #[test]
     fn desktop_qa_owns_one_surface_until_voice_processing_finishes() {

@@ -527,19 +527,87 @@ async fn load_model(alias: &str, _dir: &Path) -> Result<LoadedModel> {
     }
 }
 
+/// The ONNX Runtime CPU memory arena hands memory back to the OS never: "once
+/// allocated it always remains allocated". For a resident dictation process that
+/// turns each decode's working set into a permanent high-water mark (measured on
+/// `sense-voice-small-zh`: +9 MB per decode, 463 MB steady). sherpa-onnx exposes
+/// no arena field in its Rust config; the only channel is `provider =
+/// "cpu:<config file>"`, which it splits on the first ':' and parses.
+#[cfg(local_asr_sherpa)]
+const ORT_PROVIDER_CONFIG: &str = "EnableCpuMemArena=0\n";
+
+#[cfg(local_asr_sherpa)]
+const ORT_PROVIDER_CONFIG_FILE: &str = "cpu-no-mem-arena.config";
+
+/// Path for the provider config. Kept out of the model directory so a model
+/// re-download or relocation can never leave the recognizer pointing at a
+/// deleted file.
+#[cfg(local_asr_sherpa)]
+fn ort_provider_config_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("openless-ort")
+        .join(ORT_PROVIDER_CONFIG_FILE)
+}
+
+/// Builds the sherpa `provider` string, opt-out written fresh on every call.
+///
+/// `session.cc` calls `SHERPA_ONNX_EXIT(-1)` — killing the process outright —
+/// when the config file cannot be parsed, and temp cleaners can remove the file
+/// between sessions. So this never assumes a previously written file is still
+/// there: it rewrites it, verifies it, and falls back to the default arena
+/// (which is merely the pre-existing behaviour) on any failure.
+#[cfg(local_asr_sherpa)]
+fn cpu_provider_without_mem_arena() -> String {
+    match write_ort_provider_config() {
+        Ok(path) => format!("cpu:{}", path.display()),
+        Err(error) => {
+            log::warn!(
+                "[sherpa-asr] cpu mem-arena opt-out unavailable ({error}); keeping the default arena"
+            );
+            "cpu".to_string()
+        }
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+fn write_ort_provider_config() -> Result<PathBuf> {
+    let path = ort_provider_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, ORT_PROVIDER_CONFIG)?;
+    // The file must be readable at the exact path handed to sherpa-onnx; a
+    // silent partial write would otherwise become a hard process exit.
+    if !path.is_file() {
+        anyhow::bail!("provider config was not created at {}", path.display());
+    }
+    Ok(path)
+}
+
+/// Inference threads: user override clamped to [1, 80% of logical CPU
+/// threads]; no override = auto (80% of logical CPU threads, min 1).
+#[cfg(local_asr_sherpa)]
+fn resolve_num_threads() -> i32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let cap = ((((cores as f64) * 0.8).floor() as i32).clamp(1, cores as i32)).max(1);
+    match openless_core::shared_types::sherpa_num_threads_override() {
+        Some(value) => (value as i32).clamp(1, cap),
+        None => cap,
+    }
+}
+
 #[cfg(local_asr_sherpa)]
 fn create_offline_recognizer(alias: &str, dir: &Path) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
-    let default_num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(1, 4) as i32)
-        .unwrap_or(2);
-    config.model_config.num_threads = default_num_threads;
-    #[cfg(target_os = "windows")]
-    {
-        // Keep Windows offline decode on one ONNX worker until native multi-threaded decode is proven stable.
-        config.model_config.num_threads = 1;
-    }
-    config.model_config.provider = Some("cpu".into());
+    config.model_config.num_threads = resolve_num_threads();
+    config.model_config.provider = Some(cpu_provider_without_mem_arena());
+    log::info!(
+        "[sherpa-asr] offline recognizer num_threads={} provider={}",
+        config.model_config.num_threads,
+        config.model_config.provider.as_deref().unwrap_or("")
+    );
     match sherpa_target(alias)?.sherpa_family() {
         Some(openless_core::SherpaModelFamily::SenseVoice) => {
             config.model_config.tokens = Some(path_to_string(&dir.join("tokens.txt"))?);
@@ -576,25 +644,12 @@ fn create_offline_recognizer(alias: &str, dir: &Path) -> Result<OfflineRecognize
                 max_new_tokens: QWEN3_ASR_MAX_NEW_TOKENS,
                 ..Default::default()
             };
-            #[cfg(target_os = "windows")]
-            {
-                config.model_config.num_threads = 1;
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                config.model_config.num_threads = 3;
-            }
         }
         Some(openless_core::SherpaModelFamily::Zipformer) => {
             anyhow::bail!("zipformer is not supported by offline batch M2")
         }
         None => anyhow::bail!("unknown sherpa-onnx model family: {alias}"),
     }
-    log::info!(
-        "[sherpa-asr] create offline recognizer model={} threads={}",
-        alias,
-        config.model_config.num_threads
-    );
     OfflineRecognizer::create(&config)
         .ok_or_else(|| anyhow::anyhow!("create sherpa-onnx offline recognizer failed"))
 }
@@ -605,7 +660,7 @@ fn create_online_recognizer(alias: &str, dir: &Path) -> Result<OnlineRecognizer>
     config.model_config.num_threads = std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 4) as i32)
         .unwrap_or(2);
-    config.model_config.provider = Some("cpu".into());
+    config.model_config.provider = Some(cpu_provider_without_mem_arena());
     config.enable_endpoint = true;
     config.rule1_min_trailing_silence = 2.4;
     config.rule2_min_trailing_silence = 1.2;
@@ -644,102 +699,33 @@ async fn transcribe_loaded_model(
     language_hint: Option<String>,
     audio_timeout: std::time::Duration,
 ) -> Result<String> {
-    let model_alias = loaded.alias.clone();
-    let chunk_count = pcm_chunks.len();
-    let decode_model_alias = model_alias.clone();
-    log::info!(
-        "[sherpa-asr] native decode begin model={} chunks={}",
-        model_alias,
-        chunk_count
-    );
-    let result = run_serialized_decode(
+    run_serialized_decode(
         Arc::clone(&loaded.decode_gate),
         audio_timeout,
         move |cancelled| {
             let mut texts = Vec::with_capacity(pcm_chunks.len());
-            for (chunk_index, pcm) in pcm_chunks.into_iter().enumerate() {
+            for pcm in pcm_chunks {
                 if cancelled.load(Ordering::Acquire) {
                     anyhow::bail!("sherpa-onnx transcribe cancelled");
                 }
-                let chunk_number = chunk_index + 1;
-                let chunk_audio_ms = pcm_duration_ms(&pcm);
-                log::info!(
-                    "[sherpa-asr] native decode chunk model={} chunk={}/{} audio_ms={} stage=chunk_begin",
-                    decode_model_alias,
-                    chunk_number,
-                    chunk_count,
-                    chunk_audio_ms
-                );
                 let samples = pcm_s16le_to_f32(&pcm)?;
-                log::info!(
-                    "[sherpa-asr] native decode chunk model={} chunk={}/{} samples={} stage=stream_create",
-                    decode_model_alias,
-                    chunk_number,
-                    chunk_count,
-                    samples.len()
-                );
                 let stream = loaded.recognizer.create_stream();
-                log::info!(
-                    "[sherpa-asr] native decode chunk model={} chunk={}/{} stage=stream_created",
-                    decode_model_alias,
-                    chunk_number,
-                    chunk_count
-                );
                 if let Some(language) = language_hint.as_deref().filter(|value| !value.is_empty()) {
                     if stream.has_option("language") {
                         stream.set_option("language", language);
                     }
                 }
                 stream.accept_waveform(16_000, &samples);
-                log::info!(
-                    "[sherpa-asr] native decode chunk model={} chunk={}/{} stage=waveform_accepted",
-                    decode_model_alias,
-                    chunk_number,
-                    chunk_count
-                );
                 loaded.recognizer.decode(&stream);
-                log::info!(
-                    "[sherpa-asr] native decode chunk model={} chunk={}/{} stage=decoded",
-                    decode_model_alias,
-                    chunk_number,
-                    chunk_count
-                );
                 let result = stream
                     .get_result()
                     .ok_or_else(|| anyhow::anyhow!("sherpa-onnx returned no result"))?;
-                log::info!(
-                    "[sherpa-asr] native decode chunk model={} chunk={}/{} text_chars={} stage=result_received",
-                    decode_model_alias,
-                    chunk_number,
-                    chunk_count,
-                    result.text.chars().count()
-                );
                 texts.push(result.text);
             }
-            let text = openless_core::asr::whisper::join_transcript_chunks(&texts);
-            log::info!(
-                "[sherpa-asr] native decode complete model={} chunks={} text_chars={}",
-                decode_model_alias,
-                chunk_count,
-                text.chars().count()
-            );
-            Ok(text)
+            Ok(openless_core::asr::whisper::join_transcript_chunks(&texts))
         },
     )
-    .await;
-    match &result {
-        Ok(text) => log::info!(
-            "[sherpa-asr] native decode returned model={} text_chars={}",
-            model_alias,
-            text.chars().count()
-        ),
-        Err(error) => log::warn!(
-            "[sherpa-asr] native decode failed model={} error={:#}",
-            model_alias,
-            error
-        ),
-    }
-    result
+    .await
 }
 
 #[cfg(not(local_asr_sherpa))]

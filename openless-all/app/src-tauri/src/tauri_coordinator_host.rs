@@ -19,6 +19,7 @@ use capsule_hit_test::{
 
 #[path = "capsule_snapshot.rs"]
 mod capsule_snapshot;
+pub(crate) use capsule_snapshot::dictation_completed_capsule_state;
 
 use capsule_snapshot::CapsuleSnapshotState;
 use openless_core::BackendEvent;

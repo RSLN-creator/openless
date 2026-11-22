@@ -230,12 +230,20 @@ fn hide_vocab_suggestion_card(inner: &Arc<Inner>) {
 /// Window width of the insert-fallback card (logical points). Slightly wider
 /// than the vocab card — this one holds a full passage.
 const FALLBACK_CARD_WIDTH: f64 = 360.0;
-/// Safe height before the webview's first render. The real height is measured
-/// from the card DOM and reported back over IPC.
-const FALLBACK_CARD_INITIAL_HEIGHT: f64 = 260.0;
+/// Off-screen probe height. The window is hidden until the card DOM reports
+/// its real height, so this value is never composited; keeping it at the
+/// minimum avoids ever flashing a larger transparent surface.
+const FALLBACK_CARD_INITIAL_HEIGHT: f64 = 96.0;
 /// Native safety bounds for the size IPC; not a CSS layout rule.
 const FALLBACK_CARD_MIN_HEIGHT: f64 = 96.0;
 const FALLBACK_CARD_MAX_HEIGHT: f64 = 320.0;
+/// If the card renderer fails to report a height, reveal at the probe size
+/// rather than leaving the user with no visible result at all.
+const FALLBACK_CARD_REVEAL_TIMEOUT_MS: u64 = 1200;
+/// Let WebView2 apply the final window size and paint one settled frame before
+/// the hidden window is shown. Without this, a reveal can display an empty
+/// compositor surface for one frame.
+const FALLBACK_CARD_SETTLE_MS: u64 = 500;
 
 fn validated_fallback_card_height(
     active_presentation_id: Option<u64>,
@@ -294,17 +302,16 @@ fn show_insert_fallback_card(inner: &Arc<Inner>, text: String, reason: &'static 
             reason: reason.to_string(),
             presentation_id,
         };
+        // Hide before touching geometry. The card's real height is measured by
+        // the frontend; showing the placeholder surface first is what produced
+        // the large-then-small flash.
+        capsule.prepare_fallback_card_window();
         #[cfg(not(mobile))]
         if let Err(e) = capsule.set_card_hit_test_mode() {
             log::warn!("[fallback-card] enabling card hit testing failed: {e}");
         }
         if let Err(e) = capsule.set_size(FALLBACK_CARD_WIDTH, FALLBACK_CARD_INITIAL_HEIGHT) {
             log::warn!("[fallback-card] resize failed: {e}");
-        }
-        if let Err(e) =
-            capsule.position_fallback_card(FALLBACK_CARD_WIDTH, FALLBACK_CARD_INITIAL_HEIGHT)
-        {
-            log::warn!("[fallback-card] position failed: {e}");
         }
         if let Err(e) = capsule.refresh_card_hit_test() {
             log::warn!("[fallback-card] refreshing card hit testing failed: {e}");
@@ -316,13 +323,52 @@ fn show_insert_fallback_card(inner: &Arc<Inner>, text: String, reason: &'static 
         // bottom-right corner.
         capsule.invalidate_layout();
         inner.host.emit_insert_fallback(&payload);
-        capsule.show_for_recording(true);
-        #[cfg(target_os = "macos")]
-        capsule.restore_main_window_key_if_active();
+        schedule_insert_fallback_reveal(&inner, presentation_id);
         log::info!(
-            "[fallback-card] shown: reason={reason} chars={}",
+            "[fallback-card] prepared off-screen: reason={reason} chars={}",
             payload.text.chars().count()
         );
+    });
+}
+
+/// Safety net for a renderer that never reports its measured height. The
+/// normal path reveals from `report_insert_fallback_card_height`.
+fn schedule_insert_fallback_reveal(inner: &Arc<Inner>, presentation_id: u64) {
+    let inner = Arc::clone(inner);
+    let spawner = inner.host.clone();
+    spawner.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            FALLBACK_CARD_REVEAL_TIMEOUT_MS,
+        ))
+        .await;
+        let Some(capsule) = inner.host.capsule_window() else {
+            return;
+        };
+        let _ = capsule.run_on_main_thread(move |capsule| {
+            if inner
+                .host
+                .insert_fallback_presentation_is_current(presentation_id)
+                && !capsule.fallback_card_already_revealed()
+            {
+                // The measured-height path owns geometry once it has revealed.
+                // Positioning here with the probe height would move a card that
+                // is already visible on screen.
+                if let Err(e) =
+                    capsule.position_fallback_card(FALLBACK_CARD_WIDTH, FALLBACK_CARD_INITIAL_HEIGHT)
+                {
+                    log::warn!("[fallback-card] timeout position failed: {e}");
+                }
+                if capsule.reveal_fallback_card() {
+                    log::warn!(
+                        "[fallback-card] no height report within {FALLBACK_CARD_REVEAL_TIMEOUT_MS}ms; revealed at probe size"
+                    );
+                }
+            } else {
+                log::debug!(
+                    "[fallback-card] timeout skipped: presentation is stale or already revealed"
+                );
+            }
+        });
     });
 }
 
@@ -351,13 +397,43 @@ fn report_insert_fallback_card_height(
         if let Err(e) = capsule.set_size(FALLBACK_CARD_WIDTH, height) {
             log::warn!("[fallback-card] measured resize failed: {e}");
         }
-        if let Err(e) = capsule.position_fallback_card(FALLBACK_CARD_WIDTH, height) {
-            log::warn!("[fallback-card] measured position failed: {e}");
-        }
         if let Err(e) = capsule.refresh_card_hit_test() {
             log::warn!("[fallback-card] refreshing measured card hit testing failed: {e}");
         }
+        log::info!("[fallback-card] measured height={height}; waiting for settled paint");
+        reveal_insert_fallback_after_settle(&inner_for_main, presentation_id, height);
     })
+}
+
+/// Shows a measured card only after WebView2 has had time to apply the final
+/// size and paint while the HWND is still hidden.
+fn reveal_insert_fallback_after_settle(inner: &Arc<Inner>, presentation_id: u64, height: f64) {
+    let inner = Arc::clone(inner);
+    let spawner = inner.host.clone();
+    spawner.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            FALLBACK_CARD_SETTLE_MS,
+        ))
+        .await;
+        let Some(capsule) = inner.host.capsule_window() else {
+            return;
+        };
+        let _ = capsule.run_on_main_thread(move |capsule| {
+            if inner
+                .host
+                .insert_fallback_presentation_is_current(presentation_id)
+            {
+                if let Err(e) = capsule.position_fallback_card(FALLBACK_CARD_WIDTH, height) {
+                    log::warn!("[fallback-card] measured position failed: {e}");
+                }
+                if capsule.reveal_fallback_card() {
+                    #[cfg(target_os = "macos")]
+                    capsule.restore_main_window_key_if_active();
+                    log::info!("[fallback-card] revealed after settled paint");
+                }
+            }
+        });
+    });
 }
 
 /// Dismisses the fallback card and returns the window fully to the capsule.
